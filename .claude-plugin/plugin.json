@@ -1,0 +1,65 @@
+{
+  "name": "simaphore",
+  "version": "1.0.0",
+  "description": "Traffic lights for iOS simulators and Xcode builds when several Claude Code agents share one Mac: a live panel, a build queue and simulator leases.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "buildJobs": {
+      "type": "number",
+      "title": "Build jobs",
+      "description": "Value inserted as -jobs after xcodebuild when the command has none.",
+      "default": 6
+    },
+    "idleMinutes": {
+      "type": "number",
+      "title": "Idle minutes",
+      "description": "A simulator counts as idle after this many minutes under 2% CPU.",
+      "default": 10
+    },
+    "maxBuilds": {
+      "type": "number",
+      "title": "Max builds",
+      "description": "How many Claude builds may run at once when memory is fine. Under memory pressure it drops to 1.",
+      "default": 2
+    },
+    "swapPercent": {
+      "type": "number",
+      "title": "Swap percent",
+      "description": "Memory counts as tight when swap used is over this percent of swap total.",
+      "default": 85
+    },
+    "maxSims": {
+      "type": "number",
+      "title": "Simulator budget",
+      "description": "At most this many simulators on at once. A command that needs another one waits for room; the longest-idle simulator an agent used is shut down.",
+      "default": 2
+    },
+    "renameSims": {
+      "type": "boolean",
+      "title": "Rename held simulators",
+      "description": "While an agent holds a simulator, rename it to \"🔒 <who> · <name>\". The name comes back when it is freed.",
+      "default": true
+    },
+    "reservedSims": {
+      "type": "string",
+      "title": "Your simulators",
+      "description": "Names of simulators that are yours, comma separated. Agents never get these.",
+      "default": ""
+    },
+    "lowDiskGb": {
+      "type": "number",
+      "title": "Low disk GB",
+      "description": "The panel warns when free disk space is under this many GB.",
+      "default": 20
+    },
+    "asciiSymbols": {
+      "type": "boolean",
+      "title": "ASCII symbols",
+      "description": "Draw > + x * instead of the check, cross and dot symbols.",
+      "default": false
+    }
+  },
+  "author": {
+    "name": "omaestra"
+  }
+}

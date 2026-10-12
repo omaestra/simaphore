@@ -1,0 +1,11 @@
+#!/bin/sh
+# xcode-slot <build|test> [label]: run by xcq in place of a build while Xcode builds for an agent.
+# Prints "go" once it holds the slot, then waits until killed. It also ends when the Claude
+# process that started xcq is gone, or after two hours, so a lost session can't keep the slot.
+echo go
+host=$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')
+n=0
+while [ $n -lt 3600 ]; do
+  case $host in ''|1) ;; *) kill -0 "$host" 2>/dev/null || exit 0 ;; esac
+  sleep 2; n=$((n+1))
+done

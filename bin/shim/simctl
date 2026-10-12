@@ -1,0 +1,8 @@
+#!/bin/bash
+# PATH shim: a bare `simctl <verb>` on a held simulator is refused (exit 75), like shim/xcrun.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/../lib.sh"
+[ $# -gt 0 ] && { sim_guard "$@" || exit $?; }
+exec "${XCQ_REAL_XCRUN:-/usr/bin/xcrun}" simctl "$@"

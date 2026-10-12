@@ -1,0 +1,11 @@
+{
+  "name": "simaphore",
+  "owner": { "name": "omaestra" },
+  "plugins": [
+    {
+      "name": "simaphore",
+      "source": "./",
+      "description": "Traffic lights for iOS simulators and Xcode builds when several Claude Code agents share one Mac."
+    }
+  ]
+}

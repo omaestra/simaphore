@@ -1,0 +1,267 @@
+#!/bin/bash
+# xcq <ticket-id> <label> <command-string>   (run through zsh -c)
+# xcq <ticket-id> <label> -- <prog> [args...] (run directly, args kept exact)
+# Runs the build when it is our turn in the queue.
+# Exit codes of its own: 64 usage, 4 simulator reserved, 74 lease folder not writable,
+# 76 simulator list unreadable; otherwise the command's exit code.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/lib.sh"
+if [ $# -lt 3 ]; then echo "usage: xcq <ticket-id> <label> <command-string> | -- <prog> [args...]" >&2; exit 64; fi
+ticket=$1 label=$2
+argv=0 dest= ws= prj=
+if [ "$3" = "--" ]; then
+  [ $# -lt 4 ] && { echo "usage: xcq <ticket-id> <label> -- <prog> [args...]" >&2; exit 64; }
+  argv=1; shift 3; cmd="$*"
+  prev=
+  for a in "$@"; do   # pick flag values out of the real argv
+    case $prev in -destination) dest=$a ;; -workspace) ws=$a ;; -project) prj=$a ;; esac
+    prev=$a
+  done
+else
+  cmd=$3
+  # best effort on a command string: quoted value first, then bare word
+  flagval() {
+    local v
+    v=$(printf %s "$cmd" | sed -n "s/.*[ ]$1[ =]['\"]\([^'\"]*\)['\"].*/\1/p" | head -1)
+    [ -z "$v" ] && v=$(printf %s "$cmd" | sed -n "s/.*[ ]$1[ =]\([^ '\"]*\).*/\1/p" | head -1)
+    printf %s "$v"
+  }
+  dest=$(flagval -destination); ws=$(flagval -workspace); prj=$(flagval -project)
+fi
+[ -z "$ws" ] && ws=$prj
+# sim (for the ticket): the id=... part if present, else name=..., else the whole spec.
+# simid (for the gate): only a UUID-shaped id on a simulator; a device id or a bare name is not gated.
+sim= simid= XCSIM=$BIN/xcsim
+if [ -n "$dest" ]; then
+  idpart=$(printf %s "$dest" | tr ',' '\n' | sed -n 's/^id=//p' | head -1)
+  sim=$idpart
+  [ -z "$sim" ] && sim=$(printf %s "$dest" | tr ',' '\n' | sed -n 's/^name=//p' | head -1)
+  [ -z "$sim" ] && sim=$dest
+  if is_uuid "$idpart"; then
+    case $dest in *platform=*) case $dest in *Simulator*) simid=$idpart ;; esac ;; *) simid=$idpart ;; esac
+  fi
+fi
+export XCQ_HELD=1 XCQ_HELD_BY=$$   # nested xcodebuild calls (shim) pass straight through
+DIR=${SIMAPHORE_DIR:-$HOME/.claude/simaphore}
+Q=$DIR/queue
+mkdir -p "$Q"
+me=$Q/$ticket.ticket
+child=
+waiting=
+HOLD=$DIR/hold
+PAUSED=$DIR/queue-paused   # the owner paused the queue: nothing new starts, running builds carry on
+HOLD_FRESH_S=15
+
+write_ticket() {  # atomic: temp file + mv (temp name never matches *.ticket)
+  { echo "pid=$$"; echo "label=$(clean "$label")"; echo "queued=$queued"; echo "state=$1"
+    [ -n "$2" ] && echo "started=$2"
+    echo "cmd=$(printf %s "$cmd" | tr '\r\n' '  ' | cut -c1-200)"
+    echo "session=$(clean "$XCQ_SESSION")"; echo "agent=$(clean "$XCQ_AGENT")"; echo "cwd=$(clean "$PWD")"
+    echo "sim=$(clean "$sim")"; echo "workspace=$(clean "$ws")"
+    [ -n "$waiting" ] && echo "waiting=$waiting"; } > "$Q/.tmp.$ticket.$$"
+  mv "$Q/.tmp.$ticket.$$" "$me"
+}
+
+json_str() { printf %s "$1" | tr -d '\n' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# The action word of the command, as the panel names it (same order as its list of kinds).
+kind_of() {
+  local w
+  set -f; xb_scan $cmd; set +f   # no globbing of the words
+  for w in $XB_ACTIONS; do
+    case " $XB_FOUND " in *" $w "*) echo "$w"; return ;; esac
+  done
+  echo build
+}
+
+# When the command ends on its own, leave results/<ticket>.json for the panel (atomic: temp file + mv).
+# The sampler drops files older than an hour.
+write_result() {
+  local R=$DIR/results now
+  now=$(date +%s)
+  mkdir -p "$R" 2>/dev/null || return 0
+  printf '{"session":"%s","agent":"%s","label":"%s","kind":"%s","exit":%s,"endedAt":%s,"tookS":%s}\n' \
+    "$(json_str "$XCQ_SESSION")" "$(json_str "$XCQ_AGENT")" "$(json_str "$label")" "$(json_str "$(kind_of)")" \
+    "$1" $((now * 1000)) $((now - started_at)) > "$R/.tmp.$ticket.$$" 2>/dev/null \
+    && mv "$R/.tmp.$ticket.$$" "$R/$ticket.json" 2>/dev/null
+  rm -f "$R/.tmp.$ticket.$$" 2>/dev/null
+  return 0
+}
+
+cleanup() {
+  drop_lock
+  [ -n "$child" ] && killtree "$child"
+  rm -f "$me" "$Q/$ticket.prio" "$Q/.tmp.$ticket.$$"
+}
+exit_traps cleanup
+
+nap() { wake_wait 2 --memory --devices "$Q" "$PAUSED" "$HOLD" "$DIR/leases" "$DIR/panels"; }
+
+# Sorted ticket ids: running first, then .prio, then queued time, then id.
+ordered() {
+  local f id rank
+  for f in "$Q"/*.ticket; do
+    [ -e "$f" ] || continue
+    id=$(basename "$f" .ticket)
+    if ! kill -0 "$(val "$f" pid)" 2>/dev/null; then rm -f "$f" "$Q/$id.prio"; continue; fi
+    case $(val "$f" waiting) in sim|room) continue ;; esac   # waiting on a simulator, not on a slot
+    rank=2
+    [ -e "$Q/$id.prio" ] && rank=1
+    [ "$(val "$f" state)" = running ] && rank=0
+    echo "$rank $(val "$f" queued) $id"
+  done | sort -k1,1n -k2,2n -k3,3 | awk '{print $3}'
+}
+
+# The owner's own Xcode/terminal build is compiling: the sampler refreshes $HOLD every sample.
+# A file older than HOLD_FRESH_S is left over from a sampler that is gone, so it is ignored.
+is_held() {
+  local m
+  m=$(stat -f %m "$HOLD" 2>/dev/null) || return 1
+  [ $(( $(date +%s) - m )) -lt $HOLD_FRESH_S ]
+}
+
+MAX_BUILDS=${XCQ_MAX_BUILDS:-2}; SWAP_PCT=${XCQ_SWAP_PCT:-85}
+case $MAX_BUILDS in ''|*[!0-9]*|0) MAX_BUILDS=2 ;; esac
+case $SWAP_PCT in ''|*[!0-9]*) SWAP_PCT=85 ;; esac
+
+# Sets pressure (1 normal, 2 warning, 4 critical), swap_pct and mem_text. XCQ_FAKE_* (or, with XCQ_TEST=1, a file that sets them) are for tests.
+read_memory() {
+  [ -n "$XCQ_TEST" ] && [ -n "$XCQ_FAKE_FILE" ] && . "$XCQ_FAKE_FILE"   # test-only: runs a file
+  pressure=${XCQ_FAKE_PRESSURE:-$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)}
+  swap_pct=${XCQ_FAKE_SWAP_PCT:-$(sysctl -n vm.swapusage 2>/dev/null | awk '
+    function mb(s) { n = s + 0; if (s ~ /G/) n *= 1024; else if (s ~ /K/) n /= 1024; return n }
+    { for (i = 1; i < NF; i++) { if ($i == "total") t = mb($(i + 2)); if ($i == "used") u = mb($(i + 2)) } }
+    END { print (t > 0 ? int(u * 100 / t) : 0) }')}
+  case $pressure in 2) word=warning ;; 4) word=critical ;; *) pressure=1 word=normal ;; esac
+  mem_text="swap ${swap_pct:-0}%, pressure $word"
+}
+
+# 0: we hold the simulator and there is room. 1: wait (sets reason and msg). Fatal codes exit.
+# xcsim exit 64 means "not a simulator": skip the gate.
+sim_check() {
+  local out rc
+  sim_active || { simid=; return 0; }   # simaphore is off: no gate
+  out=$("$XCSIM" claim "$simid"); rc=$?
+  case $rc in
+    0) ;;
+    1) reason=sim; msg="simulator held by $out"; return 1 ;;
+    4) echo "xcq: simulator is reserved"; exit 4 ;;
+    64) simid=; return 0 ;;
+    74) echo "xcq: cannot write the lease folder in $DIR/leases"; exit 74 ;;
+    76) echo "xcq: cannot read the simulator list"; exit 76 ;;
+    *) echo "xcq: simulator check failed (xcsim exit $rc)"; exit $rc ;;
+  esac
+  out=$("$XCSIM" room "$simid") && return 0
+  reason=room; msg="$out simulators on, waiting for room"; return 1
+}
+
+simlast=
+sim_wait() {  # say what we wait for (once), mark the ticket, sleep
+  [ "$waiting" != "$reason" ] && { waiting=$reason; write_ticket waiting; }
+  [ "$simlast" != "$msg" ] && { echo "xcq: $msg"; simlast=$msg; }
+  nap
+}
+
+# Returns once this ticket has a build slot (state=running).
+queue_wait() {
+  local list pos running building id limit reason key msg outside last=
+  waiting=; write_ticket waiting
+  while :; do
+    sim_active || { waiting=; write_ticket running "$(date +%s)"; return 0; }   # off: start now
+    list=$(ordered)
+    pos=$(echo "$list" | grep -nx "$ticket" | cut -d: -f1)
+    [ -z "$pos" ] && { write_ticket waiting; nap; continue; }   # our ticket was wrongly swept
+    running=0 building=
+    for id in $list; do
+      if [ "$(val "$Q/$id.ticket" state)" = running ]; then
+        running=$((running+1)); building="${building:+$building, }$(val "$Q/$id.ticket" label)"
+      fi
+    done
+    # Builds started outside the queue (say, while simaphore was off) take room too.
+    outside=$(outside_builds)
+    [ "${outside:-0}" -gt 0 ] && building="${building:+$building, }$outside outside the queue"
+    read_memory
+    limit=$MAX_BUILDS
+    { [ "$pressure" = 2 ] || [ "${swap_pct:-0}" -gt "$SWAP_PCT" ]; } && limit=1   # tight: one at a time
+    # Waiting tickets come after the running ones, so the first waiter sits at running+1.
+    reason=
+    if [ -e "$PAUSED" ]; then reason=paused
+    elif [ "$pos" -ne $((running+1)) ]; then reason=turn
+    elif is_held; then reason=hold
+    elif [ "$pressure" = 4 ]; then reason=critical   # running builds carry on; nothing new starts
+    elif [ $((running + ${outside:-0})) -ge "$limit" ]; then
+      if [ "$limit" -lt "$MAX_BUILDS" ]; then reason=memory; else reason=turn; fi
+    fi
+    if [ -z "$reason" ]; then
+      # Claim a slot, then recount. Whoever counts last sees the other claim, so the cap holds in a race.
+      waiting=; write_ticket running "$(date +%s)"
+      others=0
+      for id in $(ordered); do
+        [ "$id" != "$ticket" ] && [ "$(val "$Q/$id.ticket" state)" = running ] && others=$((others+1))
+      done
+      [ $((others + ${outside:-0})) -lt "$limit" ] && return 0
+      echo "xcq: two builds claimed at once, waiting again"
+      waiting=turn; write_ticket waiting
+      continue   # both losers re-queue; queue order then lets the earlier one go first
+    fi
+    [ "$waiting" != "$reason" ] && { waiting=$reason; write_ticket waiting; }
+    case $reason in
+      paused) key=paused; msg="queue paused, waiting until it is resumed" ;;
+      hold) key=hold; msg="held for $(val "$HOLD" label)'s build" ;;
+      critical) key=critical; msg="waiting — memory critical ($mem_text), no new builds until it eases" ;;
+      memory) key=memory; msg="waiting — memory tight ($mem_text), 1 build at a time" ;;
+      *) key="turn|$pos|$building"; msg="queued at position $pos (building: ${building:-none})" ;;
+    esac
+    [ "$last" != "$key" ] && { echo "xcq: $msg"; last=$key; }
+    nap
+  done
+}
+
+queued=$(date +%s)
+write_ticket waiting
+
+# A test on a simulator id needs that simulator's lease and room (xcsim) before it takes a build slot.
+if [ -n "$simid" ]; then
+  case $(kind_of) in test|test-without-building) ;; *) simid= ;; esac
+fi
+reason= msg=
+while :; do
+  if [ -n "$simid" ]; then
+    until sim_check; do sim_wait; done   # holding the lease while queued is fine (sticky)
+  fi
+  queue_wait
+  [ -z "$simid" ] && break
+  # We have a slot. Look again, one ticket at a time: the lease may have been taken over and
+  # another ticket may have filled the room while we waited. The room lock stays until it boots.
+  if hold_lock room $$ 30; then
+    sim_check && break
+    drop_lock
+  else
+    reason=room; msg="waiting for another ticket to boot its simulator"
+  fi
+  waiting=; sim_wait   # gives the slot back (the ticket goes to waiting=sim|room)
+done
+
+echo "xcq: starting"
+started_at=$(date +%s)
+if [ $argv = 1 ]; then
+  "$@" &
+else
+  /bin/zsh -c "$cmd" &
+fi
+child=$!
+if [ -n "$simid" ]; then   # keep the room lock until the simulator is on, the build ends, or 30s pass
+  n=0
+  while kill -0 "$child" 2>/dev/null && [ $n -lt 60 ] && ! "$XCSIM" on "$simid"; do
+    sleep 0.5; n=$((n+1))
+  done
+  drop_lock
+fi
+wait $child
+rc=$?
+child=
+[ -n "$simid" ] && "$XCSIM" touch "$simid"
+write_result "$rc"
+exit $rc

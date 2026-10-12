@@ -1,0 +1,274 @@
+#!/bin/bash
+# xcsim <resolve|claim|touch|free|room|run|restore> ...   simulator leases, one holder per simulator.
+# Lease files: $DIR/leases/<UDID>.lease (key=value lines). Simulator data: `simctl list -j`.
+# Holder = $XCQ_SESSION + $XCQ_AGENT (empty agent = main). A lease whose session has no
+# $DIR/agents/<session>.json is stale and may be taken over.
+# Exit codes: claim 0 claimed/mine, 1 held by other (prints label), 4 reserved,
+# 74 cannot write the lease folder, 76 cannot read the simulator list; 64 bad usage/not a simulator ID.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/lib.sh"
+DIR=${SIMAPHORE_DIR:-$HOME/.claude/simaphore}
+L=$DIR/leases
+SIMCTL=${XCSIM_SIMCTL:-${XCQ_REAL_XCRUN:-/usr/bin/xcrun} simctl}   # the real tool, never the stand-in
+MAX_SIMS=${XCQ_MAX_SIMS:-2}
+case $MAX_SIMS in ''|*[!0-9]*) MAX_SIMS=2 ;; esac
+session=${XCQ_SESSION:-} agent=${XCQ_AGENT:-main}
+LOCK="🔒"
+
+up() { printf %s "$1" | tr 'a-z' 'A-Z'; }
+now_ms() { echo $(( $(date +%s) * 1000 )); }
+lf() { echo "$L/$1.lease"; }
+usage() { echo "usage: xcsim resolve <spec> | claim|touch|free|room|on|wait <UDID> | run <UDID> [--] <command> | restore" >&2; exit 64; }
+
+# Turns simctl's JSON into lines: UDID <tab> state <tab> name <tab> OS version <tab> runtime id
+JXA='function run(argv) {
+  var d = JSON.parse(argv[0]), ver = {}, out = [];
+  (d.runtimes || []).forEach(function (r) { ver[r.identifier] = r.version; });
+  Object.keys(d.devices || {}).forEach(function (rt) {
+    var m = rt.match(/-(\d+(?:-\d+)*)$/), v = ver[rt] || (m ? m[1].replace(/-/g, ".") : "");
+    d.devices[rt].forEach(function (s) {
+      if (s.isAvailable === false) return;
+      out.push([s.udid.toUpperCase(), s.state, s.name, v, rt].join("\t"));
+    });
+  });
+  return out.join("\n");
+}'
+load_sims() {   # fails when simctl or osascript fails, so callers never trust an empty list
+  local json
+  json=$($SIMCTL list -j 2>/dev/null) || return 1
+  SIMS=$(osascript -l JavaScript -e "$JXA" "$json" 2>/dev/null) || return 1
+}
+sim_field() { printf '%s\n' "$SIMS" | awk -F'\t' -v u="$1" -v n="$2" '$1==u{print $n; exit}'; }
+
+# "🔒 task · name" -> name; anything else is already the original
+original_of() {
+  case $1 in "$LOCK "*" · "*) printf %s "${1#*" · "}" ;; *) printf %s "$1" ;; esac
+}
+
+live() { [ -n "$1" ] && [ -e "$DIR/agents/$1.json" ]; }
+mine() { [ "$(val "$1" session)" = "$session" ] && [ "$(val "$1" agent)" = "$agent" ]; }
+
+write_lease() {  # write_lease <file> <udid> <originalName> <claimedAt> <lastUsed> [label]
+  local lbl=${6:-${XCQ_LABEL:-agent}}
+  { echo "udid=$2"; echo "session=$session"; echo "agent=$agent"
+    echo "label=$(printf %s "$lbl" | tr '\n' ' ')"; echo "originalName=$3"
+    echo "claimedAt=$4"; echo "lastUsed=$5"; } > "$1"
+}
+
+rename_sim() { $SIMCTL rename "$1" "$2" >/dev/null 2>&1; return 0; }
+
+is_on() { case $(sim_field "$1" 2) in Booted|Booting) return 0 ;; esac; return 1; }
+
+# A live queue ticket of this holder is using the simulator: its lease must not be freed.
+in_use_by_ticket() {
+  local t a
+  for t in "$DIR/queue"/*.ticket; do
+    [ -e "$t" ] || continue
+    [ "$(val "$t" session)" = "$session" ] || continue
+    a=$(val "$t" agent)
+    [ "${a:-main}" = "$agent" ] || continue
+    kill -0 "$(val "$t" pid)" 2>/dev/null || continue
+    [ "$(up "$(val "$t" sim)")" = "$1" ] && return 0
+  done
+  return 1
+}
+
+is_reserved() {  # is_reserved <UDID> <original name>
+  local n
+  grep -qx "$1" "$DIR/reserved" 2>/dev/null && return 0
+  [ -z "$XCQ_RESERVED_NAMES" ] && return 1
+  local IFS=,
+  for n in $XCQ_RESERVED_NAMES; do
+    n=${n#"${n%%[! ]*}"}; n=${n%"${n##*[! ]}"}
+    [ -n "$n" ] && [ "$n" = "$2" ] && return 0
+  done
+  return 1
+}
+
+# Everything that changes a lease runs under that simulator's lock ($DIR/locks/<UDID>).
+with_lock() {  # with_lock <UDID> <function> [args...]
+  local u=$1 fn=$2 rc
+  shift 2
+  hold_lock "$u" $$ || { echo "another claim in progress"; return 1; }
+  "$fn" "$u" "$@"; rc=$?
+  drop_lock
+  return $rc
+}
+
+touch_locked() {  # write a new file and move it over ours; the lock keeps anyone else out meanwhile
+  local u=$1 f tmp
+  f=$(lf "$u")
+  [ -e "$f" ] && mine "$f" || return 1
+  tmp="$L/.tmp.$u.$$"
+  write_lease "$tmp" "$u" "$(val "$f" originalName)" "$(val "$f" claimedAt)" "$(now_ms)" "$(val "$f" label)"
+  mv "$tmp" "$f"
+}
+
+# free_locked <UDID> [--force [session [agent [lastUsed]]]]: with --force, any non-empty value
+# given must still match the lease, so a lease taken over meanwhile is not deleted.
+free_locked() {
+  local u=$1 f orig
+  f=$(lf "$u")
+  [ -e "$f" ] || return 0
+  if [ "$2" = --force ]; then
+    [ -n "$3" ] && [ "$(val "$f" session)" != "$3" ] && return 1
+    [ -n "$4" ] && [ "$(val "$f" agent)" != "$4" ] && return 1
+    [ -n "$5" ] && [ "$(val "$f" lastUsed)" != "$5" ] && return 1
+  else
+    mine "$f" || return 1
+  fi
+  orig=$(val "$f" originalName)
+  rm -f "$f"
+  [ "$XCQ_RENAME_SIMS" != 0 ] && [ -n "$orig" ] && rename_sim "$u" "$orig"
+  return 0
+}
+
+claim_locked() {
+  local u=$1 f cur orig tmp other ou
+  f=$(lf "$u")
+  load_sims || { echo "cannot read the simulator list"; return 76; }
+  cur=$(sim_field "$u" 3); orig=$(original_of "$cur")
+  [ -z "$orig" ] && orig=$(val "$f" originalName)
+  if is_reserved "$u" "$orig"; then echo reserved; return 4; fi
+  if [ -e "$f" ]; then
+    if mine "$f"; then touch_locked "$u"; echo mine; return 0; fi
+    if live "$(val "$f" session)"; then val "$f" label; return 1; fi
+    rm -f "$f"   # stale holder: we hold the lock, so nobody else can take it first
+  fi
+  tmp="$L/.tmp.$u.$$"
+  write_lease "$tmp" "$u" "$orig" "$(now_ms)" "$(now_ms)"
+  mv "$tmp" "$f"
+  for other in "$L"/*.lease; do   # one simulator per holder, unless a live build is using it
+    [ -e "$other" ] || continue
+    ou=$(basename "$other" .lease)
+    [ "$ou" != "$u" ] && mine "$other" && ! in_use_by_ticket "$ou" && free_locked "$ou"
+  done
+  if [ "$XCQ_RENAME_SIMS" != 0 ] && [ -n "$orig" ]; then
+    rename_sim "$u" "$LOCK $(printf %s "${XCQ_LABEL:-agent}" | tr '\n' ' ' | sed 's/ · / - /g') · $orig"
+  fi
+  echo claimed
+}
+
+cmd_touch() { with_lock "$(up "$1")" touch_locked; }
+cmd_free() { local u; u=$(up "$1"); shift; with_lock "$u" free_locked "$@"; }   # free <UDID> [--force ...]
+cmd_claim() { with_lock "$(up "$1")" claim_locked; }
+
+cmd_on() {  # on <UDID>: 0 when the simulator is Booted or Booting
+  load_sims && is_on "$(up "$1")"
+}
+
+cmd_room() {
+  local u on
+  u=$(up "$1")
+  load_sims || { echo "?"; return 1; }
+  is_on "$u" && return 0
+  on=$(printf '%s\n' "$SIMS" | awk -F'\t' '$2=="Booted"||$2=="Booting"' | wc -l | tr -d ' ')
+  [ "$on" -lt "$MAX_SIMS" ] && return 0
+  echo "$on"; return 1
+}
+
+cmd_resolve() {
+  local spec=$1 id= name= os= oldifs p u st nm ver rt orig lo key a b c top n best
+  case $spec in
+    *=*) oldifs=$IFS; IFS=,
+         for p in $spec; do
+           case $p in id=*) id=${p#id=} ;; name=*) name=${p#name=} ;; OS=*|os=*) os=${p#*=} ;; esac
+         done
+         IFS=$oldifs ;;
+    *) if is_uuid "$spec"; then id=$spec; else name=$spec; fi ;;
+  esac
+  [ "$os" = latest ] && os=
+  if [ -n "$id" ]; then up "$id"; echo; return 0; fi
+  [ -z "$name" ] && return 2
+  load_sims || return 76
+  best=
+  while IFS=$'\t' read -r u st nm ver rt; do
+    [ -z "$u" ] && continue
+    orig=$(original_of "$nm"); lo=$(val "$(lf "$u")" originalName)
+    [ "$nm" = "$name" ] || [ "$orig" = "$name" ] || { [ -n "$lo" ] && [ "$lo" = "$name" ]; } || continue
+    if [ -n "$os" ]; then [ "$ver" = "$os" ] || continue; fi
+    IFS=. read -r a b c <<EOT
+$ver
+EOT
+    key=$(printf '%05d%05d%05d' $((10#${a:-0})) $((10#${b:-0})) $((10#${c:-0})))
+    best="$best$key $u
+"
+  done <<EOT
+$SIMS
+EOT
+  [ -z "$best" ] && return 2
+  top=$(printf %s "$best" | sort | tail -1 | cut -d' ' -f1)
+  n=$(printf %s "$best" | grep -c "^$top ")
+  [ "$n" -gt 1 ] && return 3
+  printf %s "$best" | grep "^$top " | cut -d' ' -f2
+}
+
+cmd_restore() {  # also unlocks sims locked from another SIMAPHORE_DIR (accepted: only one dir outside tests)
+  local u st nm ver rt
+  [ "$XCQ_RENAME_SIMS" = 0 ] && return 0
+  load_sims || return 0
+  while IFS=$'\t' read -r u st nm ver rt; do
+    case $nm in "$LOCK "*" · "*) [ -e "$(lf "$u")" ] || rename_sim "$u" "$(original_of "$nm")" ;; esac
+  done <<EOT
+$SIMS
+EOT
+  return 0
+}
+
+cmd_wait() {  # wait <UDID>: returns 0 once the simulator is ours and there is room
+  local u out rc msg last=
+  u=$(up "$1")
+  while :; do
+    sim_active || return 0   # simaphore is off: nothing to wait for
+    out=$(cmd_claim "$u"); rc=$?
+    case $rc in
+      0) out=$(cmd_room "$u") && { [ -n "$last" ] && echo "xcsim: simulator free, running"; return 0; }
+         msg="xcsim: $out simulators on, waiting for room" ;;
+      1) msg="xcsim: simulator held by $out" ;;
+      *) case $rc in
+           4) echo "xcsim: simulator is reserved" ;;
+           76) echo "xcsim: cannot read the simulator list" ;;
+           *) echo "xcsim: claim failed (exit $rc)" ;;
+         esac
+         return $rc ;;
+    esac
+    [ "$msg" != "$last" ] && { echo "$msg"; last=$msg; }
+    wake_wait "${XCSIM_POLL:-2}" --devices "$L"
+  done
+}
+
+child=
+run_cleanup() { [ -n "$child" ] && killtree "$child"; }
+
+cmd_run() {  # run <UDID> -- prog args...   |   run <UDID> <command-string>
+  local u argv=0 rc
+  u=$(up "$1"); shift
+  if [ "$1" = -- ]; then argv=1; shift; fi
+  [ $# -lt 1 ] && usage
+  cmd_wait "$u" || return $?
+  exit_traps run_cleanup
+  if [ $argv = 1 ]; then "$@" & else /bin/zsh -c "$1" & fi
+  child=$!
+  wait $child
+  rc=$?
+  child=
+  cmd_touch "$u"
+  return $rc
+}
+
+[ $# -lt 1 ] && usage
+sub=$1; shift
+case $sub in
+  resolve|claim|touch|free|room|on|wait|run) [ $# -lt 1 ] && usage ;;
+  restore) ;;
+  *) usage ;;
+esac
+case $sub in
+  resolve|restore) ;;
+  *) is_uuid "$1" || { echo "xcsim: not a simulator ID: $1" >&2; exit 64; } ;;
+esac
+mkdir -p "$L" 2>/dev/null && [ -w "$L" ] || { echo "xcsim: cannot write lease folder $L" >&2; exit 74; }
+"cmd_$sub" "$@"
+exit $?

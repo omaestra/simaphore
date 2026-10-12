@@ -1,0 +1,22 @@
+{
+  "extends": "../.claude-plugin/types/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "module": "commonjs",
+    "outDir": "../.shots-build",
+    "rootDir": "..",
+    "types": [
+      "claude-code"
+    ]
+  },
+  "include": [
+    "../scripts",
+    "../hooks/demo.fixture.ts",
+    "../hooks/screen.tsx",
+    "../hooks/settings.tsx",
+    "../types"
+  ],
+  "exclude": [
+    "../hooks/*.test.ts"
+  ]
+}

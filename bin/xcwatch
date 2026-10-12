@@ -1,0 +1,43 @@
+#!/bin/bash
+# xcwatch <build|path|wait|events> ...   wakes scripts on file, simulator, process or memory changes.
+# build: compile bin/xcwatch.swift once into $DIR/bin/xcwatch-<hash>; prints the path.
+# path: print that path (69 if not built). wait/events/tether: run the binary (69 if not built); never compile.
+# wait [--timeout S] [--memory] [--devices] <path>...   0 on first change, 1 on timeout (default 10s).
+# events [--devices] [--memory] [--pid N]... [--dir D]...   JSON lines on stdout until the parent exits.
+# tether -- <command>...   runs the command; stops it when the caller exits or this gets SIGTERM.
+# Exit codes: 69 helper unavailable (no swiftc, compile failed, not built); 64 bad usage.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/lib.sh"
+DIR=${SIMAPHORE_DIR:-$HOME/.claude/simaphore}
+SWIFT=$BIN/xcwatch.swift
+usage() { echo "usage: xcwatch build | path | wait [--timeout S] [--memory] [--devices] <path>... | events [--devices] [--memory] [--pid N]... [--dir D]... | tether -- <command>..." >&2; exit 64; }
+
+hash=$(shasum "$SWIFT" 2>/dev/null | cut -c1-12)
+[ -n "$hash" ] || { echo "xcwatch: cannot read $SWIFT" >&2; exit 69; }
+out=$DIR/bin/xcwatch-$hash
+tmp=
+
+cleanup() { drop_lock; [ -n "$tmp" ] && rm -f "$tmp"; }
+
+build() {
+  [ -x "$out" ] && { echo "$out"; return 0; }
+  command -v swiftc >/dev/null 2>&1 || { echo "xcwatch: swiftc not found" >&2; exit 69; }
+  exit_traps cleanup
+  mkdir -p "$DIR/bin" && hold_lock xcwatch-build $$ 180 || { echo "xcwatch: build lock busy" >&2; exit 69; }
+  if [ ! -x "$out" ]; then
+    tmp=$(mktemp "$DIR/bin/.xcwatch-tmp.XXXXXX") || { echo "xcwatch: cannot write $DIR/bin" >&2; exit 69; }
+    swiftc -O "$SWIFT" -o "$tmp" >/dev/null 2>&1 || { echo "xcwatch: compile failed" >&2; exit 69; }
+    mv "$tmp" "$out" && tmp=
+    for f in "$DIR"/bin/xcwatch-*; do [ "$f" = "$out" ] || rm -f "$f"; done
+  fi
+  echo "$out"
+}
+
+case ${1:-} in
+  build) build ;;
+  path) [ -x "$out" ] || exit 69; echo "$out" ;;
+  wait|events|tether) [ -x "$out" ] || exit 69; exec "$out" "$@" ;;
+  *) usage ;;
+esac

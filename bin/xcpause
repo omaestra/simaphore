@@ -1,0 +1,63 @@
+#!/bin/bash
+# xcpause pause <pid> | resume <pid> | resume-all: freeze/thaw a build and all its children.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/lib.sh"
+DIR=${SIMAPHORE_DIR:-$HOME/.claude/simaphore}
+P=$DIR/paused
+Q=$DIR/queue
+usage() { echo "usage: xcpause pause <pid> | resume <pid> | resume-all" >&2; exit 64; }
+
+stoptree() {   # top-down: stop the parent first so it cannot spawn more children
+  local c
+  kill -STOP "$1" 2>/dev/null
+  for c in $(pgrep -P "$1" 2>/dev/null); do stoptree "$c"; done
+}
+
+conttree() {   # bottom-up: wake descendants first, then the pid itself
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do conttree "$c"; done
+  kill -CONT "$1" 2>/dev/null
+}
+
+ticket_label() {   # label of the ticket owned by $1 or its nearest ancestor
+  local p=$1 f
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do
+    for f in "$Q"/*.ticket; do
+      [ -e "$f" ] || continue
+      [ "$(val "$f" pid)" = "$p" ] && { val "$f" label; return; }
+    done
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+}
+
+valid_pid() { case $1 in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 1 ]; }
+
+need_pid() {
+  valid_pid "$1" || usage
+  kill -0 "$1" 2>/dev/null || { echo "xcpause: no such process: $1" >&2; rm -f "$P/$1"; exit 1; }
+}
+
+case $1 in
+  pause)
+    need_pid "$2"
+    mkdir -p "$P"
+    label=$(ticket_label "$2")
+    stoptree "$2"
+    printf 'at=%s\nlabel=%s\n' "$(date +%s)" "$label" > "$P/$2"
+    echo "xcpause: paused $2" ;;
+  resume)
+    need_pid "$2"
+    conttree "$2"
+    rm -f "$P/$2"
+    echo "xcpause: resumed $2" ;;
+  resume-all)
+    for f in "$P"/*; do
+      [ -e "$f" ] || continue
+      pid=$(basename "$f")
+      valid_pid "$pid" && kill -0 "$pid" 2>/dev/null && conttree "$pid"
+      rm -f "$f"
+    done ;;
+  *) usage ;;
+esac

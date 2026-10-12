@@ -1,0 +1,21 @@
+#!/bin/bash
+# PATH shim: queue every real xcodebuild build, pass everything else straight through.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/../lib.sh"
+real=${XCQ_REAL_XCODEBUILD:-/usr/bin/xcodebuild}
+# Only a live xcq may mark a call as already queued (XCQ_HELD alone is not enough).
+[ -n "$XCQ_HELD" ] && is_xcq_pid "$XCQ_HELD_BY" && exec "$real" "$@"
+sim_active || exec "$real" "$@"   # simaphore is off: no queue
+
+xb_scan "$@"
+{ [ $XB_QUERY = 1 ] || [ -z "$XB_FOUND" ]; } && exec "$real" "$@"
+[ $XB_JOBS = 0 ] && set -- -jobs "${XCQ_JOBS:-6}" "$@"
+
+label=${XCQ_LABEL:-}
+if [ -z "$label" ]; then
+  top=$(git rev-parse --show-toplevel 2>/dev/null)
+  label=$(basename "${top:-$PWD}")
+fi
+exec "$BIN/../xcq" "${XCQ_TICKET:-shim}-$$" "$label" -- "$real" "$@"

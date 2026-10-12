@@ -1,0 +1,13 @@
+#!/bin/bash
+# PATH shim: `xcrun xcodebuild` goes to the build-queue stand-in; `xcrun simctl <verb>` on a held
+# simulator is refused (exit 75); everything else passes straight through.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/../lib.sh"
+real=${XCQ_REAL_XCRUN:-/usr/bin/xcrun}
+if [ "$1" = xcodebuild ]; then shift; exec "$BIN/xcodebuild" "$@"; fi
+if [ "$1" = simctl ] && [ $# -gt 1 ]; then
+  sim_guard "${@:2}" || exit $?
+fi
+exec "$real" "$@"
