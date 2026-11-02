@@ -1,6 +1,6 @@
 # Spec: android-emulators
 
-Approved: 2026-11-02 · intent: ./intent.md
+Approved: 2026-11-02 · revised: 2026-11-02 · intent: ./intent.md
 
 Terms: "SDK found" is R1. "On" means a panel is open, as today. "Xcode found" is D11. An
 emulator's "serial" is its adb name (`emulator-5554`); its "AVD name" is the virtual device's
@@ -14,9 +14,10 @@ No Android SDK
   `~/Library/Android/sdk/platform-tools/adb`. A file check, never a command.
 - R2: With no SDK found, a sampler round runs exactly today's commands: no `adb`, `emulator`,
   `android` or `java`, and no Android file reads beyond R1.
-- R3: With no SDK found, the panel, alerts, settings view, `latest.json` and every tool-call
-  decision match today for the same inputs, except the limit's new name (D1). Today's tests,
-  demo scenes and screenshot snapshots pass, changed only for that name.
+- R3: With no SDK found and Xcode found, the panel, alerts, settings view, `latest.json` and
+  every tool-call decision match today for the same inputs, except the limit's new name (D1).
+  Today's tests, demo scenes and screenshot snapshots pass, changed only for that name. A Mac
+  with neither gets the no-Xcode behavior of R28–R30 (D20).
 - R4: With the SDK found and no emulator on, every simulator decision (claim, wait, room,
   shutdown, rename, queue) is the same as today.
 
@@ -41,9 +42,11 @@ One agent per emulator
   emulator.
 - R10: `emulator -avd X` or `emulator @X` from B while A holds X waits, then runs. If X is
   free, B claims it.
-- R11: The `android` command's device commands (`android emulator start` and `stop`,
-  `android install`, `android run --device=<serial>`) follow R8 and R10 for the emulator they
-  name or default to. The exact flags are confirmed from Android's docs during planning.
+- R11: Every `android` command aimed at one emulator follows R8 and R10 for the emulator it
+  names or defaults to: `android emulator start` and `stop`, `android install`, `android run
+  --device=<serial>`, and the device commands such as `screen`, `layout`, `input`, `profiler`
+  and `device hub` (D22). Command shapes as documented at
+  developer.android.com/tools/agents/android-cli.
 - R12: `adb kill-server` and `adb reconnect` (they hit every device) are refused while
   simaphore is on and another agent holds an emulator, like `simctl shutdown all` today.
 - R13: An emulator lease is let go for the same reasons as a simulator's: the session ends or
@@ -81,7 +84,9 @@ Builds
   build.
 - R24: An agent's Gradle `install*` or `connected*` task first claims its target emulator
   (the agent's held one, else the only one on) and runs with `ANDROID_SERIAL` set to it, so
-  it waits for the emulator and a slot together, as `xcodebuild test` does.
+  it waits for the emulator and a slot together, as `xcodebuild test` does. With two or more
+  emulators on and none held by the agent, it is refused with a note listing the running
+  emulators and asking to rerun with `ANDROID_SERIAL=<serial>`, which then follows R8 (D21).
 - R25: The `android` command's build commands (`android build`, and `android run` when it
   builds) take a slot like Gradle.
 
@@ -179,9 +184,19 @@ Docs and limits
 - D18: The sampler runs `adb` only while the process list shows an emulator. Beat: every
   round when the SDK is found, which adds a process per round and starts the adb server on
   Macs that never run an emulator. (source: spec agent)
-- D19: Emulators that Gradle starts for its own tests (Gradle Managed Devices) count toward
-  the limit but are never held or shut down by simaphore. Beat: ignoring them. (source:
-  spec agent)
+- D19: Emulators that Gradle starts for its own tests (Gradle Managed Devices) get no special
+  handling. They show and count like any emulator, and R18 already keeps simaphore from
+  shutting them down, since no agent used them. Beat: recognizing and exempting them (no
+  confirmed way to recognize them, and no requirement asked for it). (source: owner, revised)
+- D20: On a Mac with neither Xcode nor the SDK, the quiet no-Xcode look wins over "exactly as
+  today" (R3, R28–R30). Beat: keeping today's broken iOS look there. (source: owner)
+- D21: Gradle install and connected tasks with several emulators on and none held are refused
+  with a note (R24). Beat: holding every running emulator for the whole build (blocks other
+  agents), and letting Gradle install onto all of them (breaks one agent per emulator).
+  (source: owner)
+- D22: Every `android` command aimed at one emulator follows the one-agent rule (R11). Beat:
+  only the four start, stop, install and run commands, leaving screen, layout and input
+  unchecked. (source: owner)
 
 ## Out of scope
 - Android MCP servers (mobile-mcp, Maestro and others): the owner left them for a later
