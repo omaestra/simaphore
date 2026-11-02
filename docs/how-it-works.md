@@ -1,6 +1,7 @@
 # How simaphore works
 
-The deep details. For the short version, see the [README](../README.md).
+The deep details. For the short version, see the [README](../README.md). For how it
+works inside, with diagrams, see [Under the hood](under-the-hood.md).
 
 A live panel for iOS work with Claude Code. Open it with `/simaphore`. It shows how
 hard your Mac is working, who is using which simulator, and what builds are

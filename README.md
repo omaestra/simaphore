@@ -157,6 +157,7 @@ command written to hide itself (with `eval`, for example) is not recognised.
 ## More
 
 - [How it works](docs/how-it-works.md): alerts, leases, scripts, Xcode tools and the details.
+- [Under the hood](docs/under-the-hood.md): how it works inside, with diagrams. How commands are caught, how simulators are matched to agents, updates, and what it reads and writes.
 - [Contributing](CONTRIBUTING.md): build, test and regenerate the screenshots.
 
 ## License
