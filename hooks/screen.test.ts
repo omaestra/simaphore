@@ -367,3 +367,35 @@ test('a leased simulator counts as in use, and xcsim waiters count as waiting', 
   expect(text).toContain('SIMULATORS · 1 of 1 in use · 1 waiting')
   expect(text).toContain('waiting: a session 1m')
 })
+
+// --- Android emulators in the panel (P8) ---
+
+const EMU = { ...sim('@Pixel_9', 'Pixel_9'), runtime: 'Android', memMb: 0, android: { serial: 'emulator-5554' } }
+
+/** A scenario with its snapshot changed: emulators added, or Xcode missing. */
+const drawWith = (name: keyof typeof scenarios, columns: number, snap: Record<string, unknown>) => {
+  const s = screenOf(name, columns)
+  return linesOf(drawScreen(fakeUi, { ...s, input: { ...s.input, snap: { ...s.input.snap, ...snap } } })).join('\n')
+}
+
+test('with an emulator on, the title, header and status line say devices; without, they say simulators', () => {
+  const withEmu = drawWith('calm', 80, { sims: [{ ...SIM_A }, EMU] })
+  const calm = draw('calm', 80).join('\n')
+  const status = linesOf(drawScreen(fakeUi, { ...screenOf('calm', 50), input: { ...scenarios.calm(), snap: { ...scenarios.calm().snap, sims: [{ ...SIM_A }, EMU] } } })).join('')
+
+  expect(withEmu).toContain('DEVICES · 0 of 2 in use')
+  expect(withEmu).toContain('Devices 2/max 2')
+  expect(withEmu).toContain('Pixel_9 · Android')
+  expect(status).toContain('devices 2/2')
+  expect(calm).toContain('SIMULATORS · 0 of 1 in use')
+  expect(calm).toContain('Sims 1/max 2')
+  expect(draw('calm', 50).join('')).toContain('sims 1/2')
+})
+
+test('without Xcode the host shows only disk space, CoreSim is never hung, and there is no c key', () => {
+  const noXcode = drawWith('hungCoreSim', 80, { hasXcode: false, sims: [EMU] })
+
+  expect(noXcode).toContain('disk free 120 GB')
+  for (const gone of ['DerivedData', 'simulator data', 'CoreSim', 'c: clean']) expect(noXcode).not.toContain(gone)
+  expect(draw('busy', 80).join('\n')).toContain('c: clean')
+})

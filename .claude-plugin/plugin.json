@@ -1,13 +1,13 @@
 {
   "name": "simaphore",
   "version": "1.0.0",
-  "description": "Traffic lights for iOS simulators and Xcode builds when several Claude Code agents share one Mac: a live panel, a build queue and simulator leases.",
+  "description": "Traffic lights for iOS simulators, Android emulators and their builds (Xcode, Gradle and the android command) when several Claude Code agents share one Mac: a live panel, a build queue and device leases.",
   "types": "./types/index.d.ts",
   "userConfig": {
     "buildJobs": {
       "type": "number",
       "title": "Build jobs",
-      "description": "Value inserted as -jobs after xcodebuild when the command has none.",
+      "description": "Value inserted as -jobs after xcodebuild when the command has none, and as --max-workers for Gradle.",
       "default": 6
     },
     "idleMinutes": {
@@ -30,20 +30,20 @@
     },
     "maxSims": {
       "type": "number",
-      "title": "Simulator budget",
-      "description": "At most this many simulators on at once. A command that needs another one waits for room; the longest-idle simulator an agent used is shut down.",
+      "title": "Simulator and emulator limit",
+      "description": "At most this many simulators and Android emulators on at once, counted together. A command that needs another one waits for room; the longest-idle device an agent used is shut down.",
       "default": 2
     },
     "renameSims": {
       "type": "boolean",
       "title": "Rename held simulators",
-      "description": "While an agent holds a simulator, rename it to \"🔒 <who> · <name>\". The name comes back when it is freed.",
+      "description": "iOS only. While an agent holds a simulator, rename it to \"🔒 <who> · <name>\". The name comes back when it is freed. Emulators are never renamed.",
       "default": true
     },
     "reservedSims": {
       "type": "string",
       "title": "Your simulators",
-      "description": "Names of simulators that are yours, comma separated. Agents never get these.",
+      "description": "Names of simulators, or Android AVD names, that are yours, comma separated. Agents never get these.",
       "default": ""
     },
     "lowDiskGb": {

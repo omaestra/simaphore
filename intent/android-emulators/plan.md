@@ -169,4 +169,153 @@ P1 → P2 → P3 → P4 → P5 → P6 → P7 → (P8 ‖ P10) → P9 → P11 →
 - Android MCP servers: Q1. Real phones: R7.
 
 ## Departures
-- none
+- P2: the D11 check is split in two. The pure part is `developerFolder` plus `simctlIn` in
+  `logic.ts`, and the file check itself runs in `register.tsx`. `roundPlan` takes
+  `{hasSdk, hasXcode, emulatorCount, adb}` and returns the simctl and plutil gates, the host
+  jobs and `adb devices`. The per-serial calls (`emu avd name`, `getprop`) come from
+  `adbFollowUps` in `android.ts`, because they need that round's `adb devices` answer.
+- P4: the SDK check uses `$.fs.exists` instead of `$.fs.list`; it is the same file check.
+  With no SDK, emulators are not listed at all and the qemu process stays an ordinary one,
+  which R3 needs. A session that is not the sampler runs its own check once, then follows
+  the sampler's `hasXcode` in `latest.json`. A failed `adb devices` call keeps the last list
+  rather than forgetting every serial.
+- P5: `has_xcode` guards every simulator-list read in `xcsim`, not just `room`. Because of
+  that, `restore` and `claim` never run `xcrun` on a Mac without Xcode either. `tests/lib.sh`
+  is changed too: `make_fake_simctl` points `DEVELOPER_DIR` at a stand-in Xcode folder, so
+  "Xcode is found" never depends on the Mac the tests run on. The reserved-file check now
+  matches exact text (`grep -F`), so a `.` in an AVD name is not read as a pattern.
+  `xcsim wait` says "emulator" for an `@` key, and its room message says "devices"
+  (simulator text unchanged).
+- P6: `emulatorDevice` turns a running emulator into a Device here, so the sampler and the
+  hook build it the same way. `booted` (simctl's word) now means the holder's simulator
+  lease only, never the emulator lease they may also hold (R14). Activities and tickets
+  naming an `@` key count as using that emulator, so "busy" and "10 minutes unused" work for
+  emulator leases (R13). `freeReason` checks "AVD deleted" only when the AVD list could be
+  read, and never "simulator deleted" for an `@` key. `roomNote` takes the plural word, so
+  the hook can say "devices" while an emulator is on. The emulator refusal names the free
+  one by its adb serial, and with none free it says "held or the owner's", since emulators
+  that are off are never offered.
+- P7: The AVD folder follows the SDK's own order (`ANDROID_AVD_HOME`, then `avd` under
+  `ANDROID_EMULATOR_HOME` or `ANDROID_USER_HOME`, then `~/.android/avd`), not just the first
+  and last, so a moved AVD home does not free every emulator lease as "AVD deleted". A running
+  emulator's AVD always counts as existing, whatever the folder says. A stopped emulator
+  forgets when agents used it, so if the owner starts it again it is never a room victim until
+  an agent uses it again. With Xcode, room is made on the rounds that read the simulator list,
+  as today (R4); without Xcode, every round while an emulator is on. After `emu kill`,
+  simaphore waits up to 30 s while that emulator is still running before choosing another
+  victim, so one slot never costs two devices. "Shut down all idle" goes through
+  `shutdownArgv` too, so it reaches idle emulators the same way as `s` (P21 checks an idle
+  emulator's CPU).
+- P8: The host line without Xcode keeps disk space and the SPM cache (neither needs Xcode),
+  and its heading reads "disk space". The CoreSim state and `simctlOk` count only when Xcode is
+  found, so an old failed reading can't turn rows red after Xcode is gone. The detail line
+  still shows the key (`udid @Pixel_9`); it is the AVD key, so it stays as it is.
+- P10: The settings label column grows from 26 to 29 cells (3/8 of the width, up from 1/3), so
+  "Simulator and emulator limit" fits from 80 columns. The four changed help lines are written
+  to fit in 76 cells, so an 80-column pane shows them in full. The picker needed no code: an
+  emulator's row in `snap.sims` already carries its AVD name. The plan named
+  `screen.snapshot.test.ts`, but there is no settings snapshot there, so the test is in
+  `settings.test.ts`, and `docs/images/settings.svg` is redrawn by `scripts/shots.sh`.
+- P9: The `android` scene sets the limit to 3, so the picture shows a calm Mac (67%) rather
+  than one at its limit. No existing snapshot changed: the panel never prints the limit's
+  name, so D1 shows only in settings. `/simaphore demo android` picks the scene up with no
+  other change.
+- P11: `adbCalls` takes the command already cut into segments, because `android.ts` imports
+  nothing and the splitter (`segmentsOf`, which drops heredoc bodies) lives in `leases.ts`;
+  P13 passes it in. The command word may sit behind `VAR=` assignments, `env`, `command`,
+  `exec`, `time`, `nohup` or `timeout N`, and may be any path ending in `adb`. Host verbs
+  also take `track-devices`, `--version` and `--help`, and a flag in the verb's place (adb only
+  prints its usage). `-s` and `-t` also work glued (`-semulator-5554`). `unset
+  ANDROID_SERIAL` and a bare `ANDROID_SERIAL=…` segment change the serial for later segments,
+  like `export`. `reconnect` is a fleet verb even with `-s`, as R12 says.
+- P12: `emulatorCalls(segments, emulators)` takes segments for the same reason as P11, plus the
+  serials of the emulators on, so "the default emulator" (the only one on) is decided here.
+  `android emulator stop` of a word that is neither a serial nor an AVD name gives no call, the
+  same as `start`. A `-h` or `--help` anywhere before a bare `--` counts as asking for help.
+- P13: `androidRoute` (the pure part of the routing) lives in `leases.ts`, next to `routeLease`'s
+  helpers, because `android.ts` imports nothing. An adb call has no AVD name, only a serial; the
+  route finds the running emulator by serial, and a call with neither matches nothing, so a
+  booting emulator with no serial yet is never claimed by mistake (R7). Without Xcode the hook
+  also skips the "all simulators" refusal, because simctl then runs as typed (R30). When one
+  command must wait for several devices, the waits are nested, one per key. If a later step
+  refuses the call, the leases this call just took are given back, including a simulator lease
+  taken by the same command. If the Android routing itself fails, the command runs as typed.
+  The hook says "devices" instead of "simulators" in room notes whenever an emulator is on.
+- P14: `segmentsOf` moves from `leases.ts` to `logic.ts` (exported), so the activity reader can
+  split commands without `logic.ts` importing `leases.ts`. `matchesSim`, `findSim` (in
+  `hooks/rows.ts`, not in the step's file list) and `sharedSims` compare an `@` key exactly
+  instead of upper-casing it like a UDID, so "last used by" works for emulators. Android
+  activities never use the kind `drive`, because a drive activity inherits the last iOS device
+  it drove; they use verify, launch, install, boot, run, build and test instead. Gradle tasks
+  outside the listed ones (`clean`, `lint`) and adb verbs outside the listed ones (`forward`,
+  `reverse`, `root`, …) give no activity of their own; a later task in the same command decides
+  the kind. `installDebugAndroidTest` counts as install. `android emulator stop <name>` records
+  `@name` as the device. When an Android activity names no `@` key itself (an adb call by
+  serial or with no target), the hook gives it the first key the routing claimed or waited
+  for — only when the activity names no device, so an iOS activity in the same command keeps
+  its simulator. The `android@80` and `android@120` snapshots were regenerated, because the
+  panel now shows the agent using the emulator. Tests also landed in `hooks/model.test.ts` and
+  `hooks/rows.test.ts`; the key handoff in `register.tsx` has no unit harness and is checked by
+  `tsc` and the scene snapshots only.
+- P15: `queueGradle` walks the original text (`rawSegments`) and keeps each word's offset, so
+  only `'<root>/bin/xcgradle' ` is inserted and the rest of the command stays as typed. It also
+  splits at a single `&` and at `(`/`)`, so `a & ./gradlew build` and `$(./gradlew …)` are
+  queued; after `env`, `command`, `exec`, `time`, `nohup` or `timeout N` the insertion goes
+  right before the Gradle word. Gradle inside quotes (`sh -c './gradlew build'`), inside
+  backticks, or run as `sh gradlew …` is not queued; `outside_builds` still counts it (R23).
+  `waitForSim` queues Gradle too, so a Gradle call in a command that waits for a device still
+  takes a slot. One helper, `gradleTasks`, holds the pass-through rule for both the activity
+  and the rewrite, and the heredoc rule matches `stripHeredocs`. `xcgradle` tells `xcq` the
+  kind through `XCQ_KIND` (`test` for `test*` and `connected*` tasks, read after the last `:`,
+  else `build`); `xcq` accepts only a known kind word there. `--max-workers N` written as two
+  words counts as given. Gradle commands now start with the shim prefix and `xcgradle`, so
+  Claude Code may ask permission for them, as it already does for prefixed `xcodebuild`.
+- P18: the pass-through rule in `outside_builds` (an info or stop flag, or no task besides
+  `tasks`/`help`) is the hook's `GRADLE_PASS` and `gradleTasks` rule written again in awk,
+  because `lib.sh` can't use the hook's code.
+- P19: the stand-ins share `emu_guard`, `emu_fleet_guard` (for `kill-server` and
+  `reconnect`), `emu_avd_of` (asks the real adb for an emulator's AVD name and gives up after
+  about 3 seconds) and `emu_default` (the only emulator on). With `-e`, or no target and one
+  emulator on, the AVD comes from the process list without an adb call. A device command on an
+  AVD that is on and free claims it; booting an AVD that is already on skips the room check and
+  goes straight to the claim. The no-room note uses the count `xcsim room` prints, which
+  includes booted simulators, because the limit is shared (D1). An empty `ANDROID_SERIAL` counts
+  as unset, as in the hook. `real_tool` skips empty PATH entries, wants a regular executable
+  file, and skips any simaphore stand-in folder (one with `../lib.sh` and `../xcsim` next to
+  it), not only its own, so two installed copies never call each other. The `kill-server`
+  refusal reads "simaphore: <what> would stop emulator <AVD> held by <label>; wait or leave it".
+- P16: the hook passes the target as words right after `xcgradle`, not as an assignment in
+  front of the command: `'<root>/bin/xcgradle' ANDROID_SERIAL='<serial>' XCQ_SIM='@<AVD>'
+  ./gradlew installDebug`. An assignment breaks after `nohup`, `exec` or `timeout`, and an
+  `export` would leak into an `xcodebuild` in the same command. `xcgradle` takes the words off
+  before anything else (also when simaphore is off or the call is already queued), exports
+  `ANDROID_SERIAL`, and hands `XCQ_SIM` to `xcq` only, so Gradle never sees it. `xcq` reads
+  `XCQ_KIND` and `XCQ_SIM` once and unsets both, so the build's children don't inherit them; an
+  `@` key gates the ticket for every kind (a simulator still only for tests), and its messages
+  say "emulator held by …", "emulator is reserved" and "N devices on". The serial the pick
+  starts from is the call's own `ANDROID_SERIAL=`, else the session's, with empty counted as
+  unset; a serial that names no emulator that is on passes. Two or more held emulators on is
+  refused like two or more on and none held. In one command a refusal wins over a pick, and
+  Gradle calls that would install onto different emulators are refused with "simaphore: these
+  Gradle calls install onto different emulators. Run them one at a time." The target's key is
+  the device's id (`@<AVD>`). The Gradle call finder is shared with P15's queue rewrite, and
+  the activity's device falls back to the target's key when nothing else names one, so the
+  panel shows the agent on that emulator. `register.tsx` also builds the list of emulators on
+  for P17. The "N devices on, waiting for room" path has no test: an emulator that is on always
+  has room, and the hook only targets one that is on.
+- P17: `queueSites` replaces P15's Gradle-only finder and also finds `android build` and
+  `android run` (when it builds, so no APKs), through `androidParts`, which `androidCallOf`
+  now shares (global options such as `--sdk X`, help and version, own words cut at `--`).
+  `android run` gets only `XCQ_SIM='@<AVD>'` for the emulator whose serial it names or defaults
+  to, never `ANDROID_SERIAL`, and no `XCQ_SIM` when there is no single emulator. The list of
+  emulators on is filled in `hooks/register.tsx`, outside P17's file list. For the `android`
+  program `xcgradle` adds no `--max-workers` (the command has none) and the kind is always
+  `build`.
+- P20: `CONTRIBUTING.md` also changed, though it is not in P20's file list: it now runs
+  `bash tests/gradle-test.sh` and names `android.ts`, `xcgradle` and the new stand-ins in its
+  layout. The README's known limits also say an idle Gradle daemon is not counted (D8) and that
+  Claude Code may ask before running Gradle (P15). `docs/how-it-works.md` gained "Android
+  emulators" and "Gradle and the android command" sections. The README's switch-on answer stays
+  simulators only: switching on holds the simulators agents were using, not emulators (no
+  requirement asks for it). No screenshot of the `android` scene was added; `scripts/shots.ts`
+  is outside P20's file list, so the docs point to `/simaphore demo android` instead.

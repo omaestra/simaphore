@@ -1,7 +1,10 @@
-// Simulator lease rules: who may use which simulator. Pure: no files, no clock, no processes.
-import type { Activity, AgentRecord } from '../types'
-import type { Proc } from './logic'
-import { UUID_SOURCE, XB_QUERY_FLAGS, XCODEBUILD_WORD, isUsing, simRef, stripHeredocs, stripQuoted } from './logic'
+// Device lease rules: who may use which simulator or emulator. Pure: no files, no clock, no processes.
+// A simulator is keyed by its UDID, an emulator by `@<AVD name>` (D5).
+import type { Activity, AgentRecord, SimStat } from '../types'
+import type { AdbCall, AdbContext, EmulatorCall } from './android'
+import { adbCalls, emulatorCalls, isAvdKey } from './android'
+import type { EmulatorSeen, Proc } from './logic'
+import { ANDROID_RUNTIME, UUID_SOURCE, XB_QUERY_FLAGS, XCODEBUILD_WORD, isUsing, segmentsOf, simRef, stripHeredocs, stripQuoted } from './logic'
 
 export const LEASE_IDLE_MS = 10 * 60_000
 export const RESERVE_WINDOW_MS = 2 * 60_000
@@ -21,13 +24,17 @@ export type Lease = {
 }
 
 export type Device = {
+  /** A simulator's UDID, or an emulator's `@<AVD name>`. */
   udid: string
   name: string
+  /** "iOS" (and other simctl platforms), or "Android" for an emulator. */
   platform: string
-  /** The runtime's exact version, e.g. "26.3.1". */
+  /** The runtime's exact version, e.g. "26.3.1"; empty for an emulator. */
   version: string
   state: string
   isAvailable: boolean
+  /** An emulator's adb name (`emulator-<port>`), once adb has given it. */
+  serial?: string
 }
 
 /** A simulator a call points at: by ID, by name (+ OS), "the one I hold", or every simulator. */
@@ -42,12 +49,19 @@ const keyOf = (l: Lease) => holderKey(l.session, l.agent)
 
 // ---------- lease files ----------
 
-// A lease file is named by its simulator's ID, and that ID ends up in shell text: only real ones pass.
+// A lease file is named by its device key, and that key ends up in shell text: only real ones pass.
 const UDID_SHAPE = new RegExp(`^${UUID_SOURCE}$`)
 
-/** Reads a lease file; undefined when it has no session or its name is not a simulator ID. */
-export function parseLease(udid: string, text: string): Lease | undefined {
-  if (!UDID_SHAPE.test(udid.toUpperCase())) return undefined
+/** A device key as leases store it: UDIDs upper-cased, AVD keys as they are (AVD names keep their case). */
+const keyOfDevice = (key: string) => (isAvdKey(key) ? key : key.toUpperCase())
+
+/** "emulator" for an `@` key, "simulator" for anything else: the word the notes use. */
+export const deviceNoun = (key: string) => (isAvdKey(key) ? 'emulator' : 'simulator')
+
+/** Reads a lease file; undefined when it has no session or its name is neither a simulator ID nor an AVD key. */
+export function parseLease(key: string, text: string): Lease | undefined {
+  const udid = keyOfDevice(key)
+  if (!isAvdKey(udid) && !UDID_SHAPE.test(udid)) return undefined
   const kv: Record<string, string> = {}
   for (const line of text.split('\n')) {
     const i = line.indexOf('=')
@@ -56,7 +70,7 @@ export function parseLease(udid: string, text: string): Lease | undefined {
   if (!kv.session) return undefined
 
   return {
-    udid: udid.toUpperCase(),
+    udid,
     session: kv.session,
     agent: kv.agent ?? '',
     label: kv.label ?? '',
@@ -101,6 +115,17 @@ export function parseDevices(json: string): Device[] {
 
   return out
 }
+
+/** A running emulator as a device: booting until adb says it finished. */
+export const emulatorDevice = (e: EmulatorSeen): Device => ({
+  udid: `@${e.avd}`,
+  name: e.avd,
+  platform: ANDROID_RUNTIME,
+  version: '',
+  state: e.isReady ? 'Booted' : 'Booting',
+  isAvailable: true,
+  ...(e.serial ? { serial: e.serial } : {}),
+})
 
 /** Compares dotted versions number by number: 27.0 > 26.5 > 26.3.1 > 26.3. */
 function compareVersions(a: string, b: string): number {
@@ -167,36 +192,6 @@ function destinationSpec(raw: string | undefined): TargetSpec | null {
   const os = field('OS')
 
   return os && os.toLowerCase() !== 'latest' ? { name, os } : { name }
-}
-
-/** The command split at `&&`, `||`, `;`, `|` and newlines outside quotes; heredoc bodies dropped. */
-function segmentsOf(command: string): string[] {
-  const raw = stripHeredocs(command)
-  const out: string[] = []
-  let current = ''
-  let quote = ''
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i]!
-    if (ch === '\\' && quote !== "'") {
-      current += ch + (raw[i + 1] ?? '')
-      i++
-    } else if (quote) {
-      if (ch === quote) quote = ''
-      current += ch
-    } else if (ch === '"' || ch === "'") {
-      quote = ch
-      current += ch
-    } else if (/^(?:&&|\|\||[;|\n])/.test(raw.slice(i, i + 2))) {
-      out.push(current)
-      current = ''
-      if (raw.slice(i, i + 2) === '&&' || raw.slice(i, i + 2) === '||') i++
-    } else {
-      current += ch
-    }
-  }
-  out.push(current)
-
-  return out
 }
 
 /** True when the words after `xcodebuild` hold a bare `test` action (not a flag's value). */
@@ -271,12 +266,13 @@ export function leaseTarget(tool: string, input: Record<string, unknown>): Targe
 export function resolveTarget(spec: TargetSpec, devices: Device[], leases: Lease[], holder: string): Resolved {
   if (spec.all) return { none: true }
   if (spec.booted) {
-    const mine = leases.find(l => keyOf(l) === holder)
+    // `booted` is simctl's word, so it means the holder's simulator, never the emulator they may also hold (R14).
+    const mine = leases.find(l => keyOf(l) === holder && !isAvdKey(l.udid))
 
     return mine && devices.some(d => d.udid === mine.udid) ? { udid: mine.udid } : { none: true }
   }
   if (spec.id) {
-    const id = spec.id.toUpperCase()
+    const id = keyOfDevice(spec.id)
 
     return devices.some(d => d.udid === id) ? { udid: id } : { none: true }
   }
@@ -307,12 +303,19 @@ export type FreeContext = {
   liveSessions: Set<string>
   endedHolders: Set<string>
   busyUdids: Set<string>
+  /** Simulators simctl lists. */
   deviceUdids: Set<string>
+  /** `@<AVD name>` of every AVD on disk; undefined when the folder could not be read (nothing is freed for it). */
+  avdKeys?: Set<string>
 }
 
 /** Why a lease should be freed, or undefined to keep it. */
 export function freeReason(lease: Lease, ctx: FreeContext): string | undefined {
-  if (!ctx.deviceUdids.has(lease.udid)) return 'simulator deleted'
+  if (isAvdKey(lease.udid)) {
+    if (ctx.avdKeys && !ctx.avdKeys.has(lease.udid)) return 'AVD deleted'
+  } else if (!ctx.deviceUdids.has(lease.udid)) {
+    return 'simulator deleted'
+  }
   if (!ctx.liveSessions.has(lease.session)) return 'session ended'
   if (ctx.endedHolders.has(keyOf(lease))) return 'helper finished'
   if (!ctx.busyUdids.has(lease.udid) && ctx.now - lease.lastUsed > LEASE_IDLE_MS) return 'unused 10 min'
@@ -389,7 +392,10 @@ export function debuggedByOwner(a: {
 export const isReserved = (device: Device, reserved: Set<string>, reservedNames: string[], originalName?: string) =>
   reserved.has(device.udid) || reservedNames.includes(device.name) || (!!originalName && reservedNames.includes(originalName))
 
-/** A simulator an agent may use instead: never leased or reserved, and off ones only with room. Never invents one. */
+/**
+ * A device of `platform` an agent may use instead: never leased or reserved, and off ones only with
+ * room (simulators and emulators share the limit). Never invents one.
+ */
 export function suggestFree(
   devices: Device[],
   leases: Lease[],
@@ -397,6 +403,7 @@ export function suggestFree(
   reservedNames: string[],
   preferName?: string,
   maxSims = Infinity,
+  platform = 'iOS',
 ): Device | undefined {
   const leased = new Set(leases.map(l => l.udid))
   const hasRoom = countOn(devices) < maxSims
@@ -406,7 +413,7 @@ export function suggestFree(
   const pick = devices
     .filter(
       d =>
-        d.platform === 'iOS' &&
+        d.platform === platform &&
         d.isAvailable &&
         !leased.has(d.udid) &&
         !isReserved(d, reserved, reservedNames) &&
@@ -528,21 +535,28 @@ export function rewriteNames(command: string, devices: Device[], leases: Lease[]
 // One sentence both "wait" notes end with.
 const WAIT_TAIL = 'you will be notified when it finishes, so do not start it again.'
 
-export const heldNote = (by: string) =>
-  `simaphore: that simulator is held by ${by}. This command waits in the background and runs when it is free; ${WAIT_TAIL}`
+// The notes name the device: "simulator" (today's text, unchanged) or "emulator" (see deviceNoun).
+export const heldNote = (by: string, noun = 'simulator') =>
+  `simaphore: that ${noun} is held by ${by}. This command waits in the background and runs when it is free; ${WAIT_TAIL}`
 
-export const roomNote = (max: number) =>
-  `simaphore: ${max} simulators are already on. This command waits in the background and runs when there is room; ${WAIT_TAIL}`
+/** `what` is plural: "simulators" while no emulator is on, "devices" otherwise. */
+export const roomNote = (max: number, what = 'simulators') =>
+  `simaphore: ${max} ${what} are already on. This command waits in the background and runs when there is room; ${WAIT_TAIL}`
 
-export const busyDeny = (by: string) => `simulator busy, held by ${by}, try again shortly`
+export const busyDeny = (by: string, noun = 'simulator') => `${noun} busy, held by ${by}, try again shortly`
 
 export const ambiguousNote = (ids: string[]) =>
   `simaphore: more than one simulator matches that name (${ids.join(', ')}); no lease was taken. Use id=<UDID> to pick one.`
 
-/** The refusal for the owner's simulator, naming a free one when there is one. */
-export const reservedDeny = (free?: Device) =>
-  'that simulator is the owner\'s; agents do not use it.' +
-  (free ? ` Use "${free.name}" instead (id=${free.udid}).` : ' No other simulator is free right now: the rest are held, the owner\'s, or off with no room to boot one.')
+/** The refusal for the owner's device, naming a free one of the same kind when there is one. */
+export function reservedDeny(free?: Device, noun = 'simulator'): string {
+  const head = `that ${noun} is the owner's; agents do not use it.`
+  if (free) return `${head} Use "${free.name}" instead (${free.serial ? `adb -s ${free.serial}` : `id=${free.udid}`}).`
+  // Emulators that are off are not known devices, so only running ones are ever offered.
+  const rest = noun === 'simulator' ? 'held, the owner\'s, or off with no room to boot one' : 'held or the owner\'s'
+
+  return `${head} No other ${noun} is free right now: the rest are ${rest}.`
+}
 
 // ---------- sampler helpers ----------
 
@@ -554,8 +568,9 @@ export const endedHolders = (agents: AgentRecord[]) =>
 export const liveSessions = (agents: AgentRecord[], pids: Set<number>) =>
   new Set(agents.filter(a => pids.has(a.pid)).map(a => a.session))
 
-/** The simulator an activity's `sim` text names, if it names exactly one. */
+/** The device an activity's `sim` text names, if it names exactly one: an `@` key, a UDID or a simulator name. */
 function simUdid(sim: string | undefined, devices: Device[], leases: Lease[]): string | undefined {
+  if (sim !== undefined && isAvdKey(sim)) return devices.some(d => d.udid === sim) ? sim : undefined
   const spec = deviceSpec(sim)
   const found = spec && resolveTarget(spec, devices, leases, '')
 
@@ -619,4 +634,64 @@ export function simsInUse(activities: Activity[], devices: Device[], now: number
   }
 
   return [...byUdid].map(([udid, { agent }]) => ({ agent, udid }))
+}
+
+// ---------- android commands in Bash ----------
+
+/** Every adb and emulator call in a command; heredoc text is ignored. */
+export function androidCallsOf(command: string, context: AdbContext): (AdbCall | EmulatorCall)[] {
+  const segments = segmentsOf(command)
+
+  return [...adbCalls(segments, context), ...emulatorCalls(segments, context.emulators)]
+}
+
+/** The running emulators in the leader's snapshot; the hook never runs adb itself. */
+export const emulatorsOf = (sims: SimStat[]): Device[] =>
+  sims
+    .filter(s => s.runtime === ANDROID_RUNTIME)
+    .map(s => emulatorDevice({ avd: s.name, pid: 0, isReady: s.state === 'Booted', serial: s.android?.serial }))
+
+/** The refusal for a verb that hits every emulator while another agent holds one. */
+export const fleetDeny = (verb: string, by: string) =>
+  `simaphore: adb ${verb} hits every emulator, and ${by} holds one; agents can't run it now, try again when it is free`
+
+export type AndroidRoute = { pass: true } | { deny: string } | { wait: string; note: string } | { claim: string }
+
+export type AndroidRouteContext = {
+  /** The running emulators, plus the iOS devices when known. */
+  devices: Device[]
+  leases: Lease[]
+  holder: string
+  reserved: Set<string>
+  reservedNames: string[]
+  maxSims: number
+}
+
+/** What to do with one adb or emulator call: run it, refuse it, wait for its emulator, or claim it first. */
+export function androidRoute(call: AdbCall | EmulatorCall, ctx: AndroidRouteContext): AndroidRoute {
+  const pass: AndroidRoute = { pass: true }
+  if (call.kind === 'host') return pass
+  if (call.kind === 'fleet') {
+    const other = ctx.leases.find(l => isAvdKey(l.udid) && holderKey(l.session, l.agent) !== ctx.holder)
+
+    return other ? { deny: fleetDeny(call.verb, other.label) } : pass
+  }
+  const avd = 'avd' in call ? call.avd : undefined
+  const running = ctx.devices.find(d => d.platform === ANDROID_RUNTIME && (avd !== undefined ? d.udid === `@${avd}` : call.serial !== undefined && d.serial === call.serial))
+  const key = avd !== undefined ? `@${avd}` : running?.udid
+  if (key === undefined) return pass
+  const isBoot = call.kind === 'boot'
+  if (!isBoot && !running) return pass
+
+  const device = running ?? { udid: key, name: key.slice(1), platform: ANDROID_RUNTIME, version: '', state: 'Shutdown', isAvailable: true }
+  if (isReserved(device, ctx.reserved, ctx.reservedNames)) {
+    const free = suggestFree(ctx.devices, ctx.leases, ctx.reserved, ctx.reservedNames, device.name, ctx.maxSims, ANDROID_RUNTIME)
+
+    return { deny: reservedDeny(free, 'emulator') }
+  }
+  const held = ctx.leases.find(l => l.udid === key && holderKey(l.session, l.agent) !== ctx.holder)
+  if (held) return { wait: key, note: heldNote(held.label, 'emulator') }
+  if (isBoot && !running && mustWaitForRoom(key, ctx.devices, ctx.maxSims)) return { wait: key, note: roomNote(ctx.maxSims, 'devices') }
+
+  return { claim: key }
 }

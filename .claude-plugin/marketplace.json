@@ -5,7 +5,7 @@
     {
       "name": "simaphore",
       "source": "./",
-      "description": "Traffic lights for iOS simulators and Xcode builds when several Claude Code agents share one Mac."
+      "description": "Traffic lights for iOS simulators, Android emulators and their builds (Xcode, Gradle and the android command) when several Claude Code agents share one Mac."
     }
   ]
 }

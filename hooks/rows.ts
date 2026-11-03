@@ -2,7 +2,7 @@
 // is doing, which simulator it is on, and how to word it. No UI and no I/O here (see screen.tsx).
 import type { Activity, AgentRecord, BuildTree, SimStat, Snapshot, Ticket } from '../types'
 import { kindOfArgs } from './builds'
-import { RECENT_MS, flagValue, isUsing, orderQueue } from './logic'
+import { RECENT_MS, flagValue, isUsing, matchesSim, orderQueue } from './logic'
 import type { Pose } from './mascot'
 import { clipCells } from './text'
 
@@ -55,7 +55,7 @@ export function shortFolder(path: string | undefined): string | undefined {
 
 /** The simulator a command or ticket named, by UDID or device name. */
 export const findSim = (ref: string | undefined, sims: SimStat[]) =>
-  ref ? sims.find(s => s.udid === ref.toUpperCase() || s.name === ref) : undefined
+  ref ? sims.find(s => matchesSim(ref, s)) : undefined
 
 export const TEST_KINDS = new Set(['test', 'test-without-building', 'build-for-testing'])
 

@@ -39,12 +39,14 @@ cat > "$T/list.json" <<EOT
 EOT
 make_fake_simctl "$T"
 export XCSIM_POLL=0.3
+export XCQ_FAKE_PS=$T/ps   # emulators running on this Mac must not count in the tests
 unset XCQ_RESERVED_NAMES XCQ_RENAME_SIMS XCQ_MAX_SIMS XCQ_LABEL XCQ_SESSION XCQ_AGENT
 
 reset() {
   rm -rf "${SIMAPHORE_DIR:?}"/*; mkdir -p "$SIMAPHORE_DIR/agents"; sim_on
-  touch "$SIMAPHORE_DIR/agents/s1.json" "$SIMAPHORE_DIR/agents/s2.json"; : > "$T/log"
+  touch "$SIMAPHORE_DIR/agents/s1.json" "$SIMAPHORE_DIR/agents/s2.json"; : > "$T/log"; : > "$T/ps"
 }
+: > "$T/ps"
 as1() { XCQ_SESSION=s1 XCQ_AGENT=${AG:-} XCQ_LABEL=${LBL:-alpha} "$XCSIM" "$@"; }
 as2() { XCQ_SESSION=s2 XCQ_LABEL=beta "$XCSIM" "$@"; }
 
@@ -406,5 +408,158 @@ XCQ_NO_WATCH=1 XCSIM_POLL=0.2 as2 wait $U1 >/dev/null & p2=$!
 sleep 1; as1 free $U1
 wait $p2; check "XCQ_NO_WATCH=1 never calls the helper" "$(wc -l < "$T/watch.log" | tr -d ' ')" 0
 unset XCQ_XCWATCH XCQ_MAX_SIMS
+
+# ---- Android emulators: keyed @<AVD name>, found in the process list, never renamed ----
+QEMU=/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64
+emus() { : > "$T/ps"; for a in "$@"; do echo "4$RANDOM 1 $QEMU -netdelay none -avd $a" >> "$T/ps"; done; }
+
+echo "== emulators: the process list"
+cat > "$T/ps" <<EOT
+100 1 /sdk/emulator/emulator -avd Pixel_9
+101 100 $QEMU -netdelay none -netspeed full -avd Pixel_9 -qt-hide-window
+102 1 qemu-system-x86_64-headless @Small.Phone-2 -no-window
+103 1 vim qemu-system-aarch64 -avd NotOne
+104 1 qemu-system-aarch64 -avd Pix'el
+105 1 qemu-system-aarch64 -avd
+106 1 /usr/bin/login -fp me
+EOT
+check "one line per emulator, never the launcher" "$(. "$(dirname "$XCSIM")/lib.sh"; emu_procs | tr '\n' ';')" "101 Pixel_9;102 Small.Phone-2;"
+check "emu_count" "$(. "$(dirname "$XCSIM")/lib.sh"; emu_count)" 2
+
+echo "== emulators: keys"
+reset
+for bad_id in @ @a/b @../x "@a b" "@a'b"; do
+  for verb in claim room wait; do
+    err=$("$XCSIM" $verb "$bad_id" 2>&1 >/dev/null); rc=$?
+    check "$verb '$bad_id' exits 64" "$rc/$err" "64/xcsim: not a simulator ID: $bad_id"
+  done
+done
+check "no lease file for a bad key" "$(ls -A "$LEASES" 2>/dev/null)" ""
+
+echo "== emulators: claim (R13, D6)"
+reset
+touch "$FAKE_SIMCTL_JSON.fail"   # a claim on an emulator never needs the simulator list
+out=$(as1 claim @Pixel_9); check "free emulator is claimed" "$out/$?" "claimed/0"
+l=$LEASES/@Pixel_9.lease
+for kv in udid=@Pixel_9 session=s1 agent=main label=alpha originalName=Pixel_9; do
+  grep -qxF "$kv" "$l" && ok "emulator lease has $kv" || bad "emulator lease lacks $kv: $(cat "$l")"
+done
+check "never renamed" "$(cat "$T/log")" ""
+out=$(as1 claim @Pixel_9); check "same holder gets mine" "$out/$?" "mine/0"
+out=$(as2 claim @Pixel_9); check "other live holder gets its label, exit 1" "$out/$?" "alpha/1"
+as1 claim @pixel_9 >/dev/null
+[ -e "$LEASES/@pixel_9.lease" ] && ok "AVD names keep their case" || bad "AVD name upper-cased: $(ls "$LEASES")"
+rm -f "$FAKE_SIMCTL_JSON.fail"
+reset
+XCQ_RESERVED_NAMES="Owner Phone, Pixel_9" as1 claim @Pixel_9 >/dev/null; check "AVD name in Your simulators exits 4" $? 4
+echo "@Tablet" > "$SIMAPHORE_DIR/reserved"
+as1 claim @Tablet >/dev/null; check "key in the reserved file exits 4" $? 4
+echo "@Pixel.9" > "$SIMAPHORE_DIR/reserved"
+as1 claim @Pixel_9 >/dev/null; check "reserved keys match exactly, not as a pattern" $? 0
+reset
+lower=$(echo "$U1" | tr 'A-Z' 'a-z')
+echo "$U1" > "$SIMAPHORE_DIR/reserved"
+as1 claim "$lower" >/dev/null; check "reserved UDID still matches in any case" $? 4
+
+echo "== emulators: one simulator and one emulator per holder (R14)"
+reset
+as1 claim $U1 >/dev/null; as1 claim @Pixel_9 >/dev/null
+[ -e "$LEASES/$U1.lease" ] && [ -e "$LEASES/@Pixel_9.lease" ] && ok "simulator and emulator held together" || bad "one lease dropped: $(ls "$LEASES")"
+check "simulator name not restored" "$(grep -c "^rename $U1 iPhone 17 Pro$" "$T/log")" 0
+as1 claim @Tablet >/dev/null
+[ ! -e "$LEASES/@Pixel_9.lease" ] && ok "second emulator frees the first" || bad "first emulator kept"
+[ -e "$LEASES/$U1.lease" ] && ok "second emulator keeps the simulator" || bad "simulator freed by an emulator claim"
+as1 claim $U2 >/dev/null
+[ ! -e "$LEASES/$U1.lease" ] && [ -e "$LEASES/@Tablet.lease" ] && ok "second simulator frees the first, keeps the emulator" || bad "wrong lease freed: $(ls "$LEASES")"
+mkdir -p "$SIMAPHORE_DIR/queue"
+sleep 30 & sp=$!
+printf 'pid=%s\nsession=s1\nagent=\nstate=running\nsim=@Tablet\n' $sp > "$SIMAPHORE_DIR/queue/t1.ticket"
+as1 claim @Pixel_9 >/dev/null
+[ -e "$LEASES/@Tablet.lease" ] && ok "emulator lease kept while a live build uses it" || bad "emulator lease freed under a build"
+kill $sp; wait $sp 2>/dev/null
+
+echo "== emulators: free and restore never rename"
+reset
+as1 claim @Pixel_9 >/dev/null
+as2 free @Pixel_9; check "other holder cannot free" $? 1
+as1 free @Pixel_9; check "holder free exits 0" $? 0
+[ ! -e "$LEASES/@Pixel_9.lease" ] && ok "emulator lease removed" || bad "emulator lease kept"
+as1 claim @Pixel_9 >/dev/null
+as2 free @Pixel_9 --force; check "--force frees an emulator" $? 0
+as1 claim @Pixel_9 >/dev/null
+"$XCSIM" restore; check "restore with an emulator lease exits 0" $? 0
+check "no rename for emulators, ever" "$(grep -c '@' "$T/log")" 0
+
+echo "== emulators: on and room share one limit (R17)"
+reset
+emus Pixel_9
+"$XCSIM" on @Pixel_9; check "on: running emulator" $? 0
+"$XCSIM" on @Tablet; check "on: emulator not running" $? 1
+out=$("$XCSIM" room @Pixel_9); check "running emulator always has room" "$out/$?" "/0"
+out=$("$XCSIM" room @Tablet); check "2 simulators + 1 emulator, limit 2: no room" "$out/$?" "3/1"
+out=$(XCQ_MAX_SIMS=4 "$XCSIM" room @Tablet); check "limit 4: room" "$out/$?" "/0"
+out=$(XCQ_MAX_SIMS=3 "$XCSIM" room $U1); check "an emulator takes a simulator's room too" "$out/$?" "3/1"
+out=$("$XCSIM" room $U3); check "booted simulator still has room" "$out/$?" "/0"
+emus
+out=$(XCQ_MAX_SIMS=3 "$XCSIM" room @Tablet); check "no emulator on: simulators only" "$out/$?" "/0"
+
+echo "== emulators: wait"
+reset
+export XCQ_NO_WATCH=1 XCSIM_POLL=0.2
+as1 claim @Pixel_9 >/dev/null
+XCQ_MAX_SIMS=3 as2 wait @Pixel_9 > "$T/out" & p2=$!
+wait_for "grep -q 'held by' '$T/out'"
+check "held message names an emulator" "$(cat "$T/out")" "xcsim: emulator held by alpha"
+as1 free @Pixel_9
+wait $p2; check "wait returns 0 after the holder frees" $? 0
+check "free line for an emulator" "$(tail -1 "$T/out")" "xcsim: emulator free, running"
+reset; emus Pixel_9
+XCQ_SESSION=s1 XCQ_LABEL=alpha "$XCSIM" wait @Tablet > "$T/out" & p1=$!   # direct, so TERM reaches xcsim
+wait_for "grep -q 'waiting for room' '$T/out'"
+check "room message counts devices" "$(cat "$T/out")" "xcsim: 3 devices on, waiting for room"
+kill -TERM $p1; wait $p1 2>/dev/null
+unset XCQ_NO_WATCH; export XCSIM_POLL=0.3
+
+echo "== Xcode check (D11)"
+xc() { (. "$(dirname "$XCSIM")/lib.sh"; has_xcode) && echo yes || echo no; }
+mkdir -p "$T/empty" "$T/Fake.app/Contents/Developer/usr/bin" "$T/bin"
+: > "$T/Fake.app/Contents/Developer/usr/bin/simctl"
+check "folder with usr/bin/simctl" "$(xc)" yes
+check "empty folder" "$(DEVELOPER_DIR=$T/empty xc)" no
+check "an .app means its Contents/Developer" "$(DEVELOPER_DIR=$T/Fake.app xc)" yes
+check "trailing slash" "$(DEVELOPER_DIR=$T/Fake.app/ xc)" yes
+printf '#!/bin/sh\necho "%s"\n' "$T/Developer" > "$T/bin/xcode-select"; chmod +x "$T/bin/xcode-select"
+check "no DEVELOPER_DIR: xcode-select -p" "$(DEVELOPER_DIR= PATH="$T/bin:$PATH" xc)" yes
+printf '#!/bin/sh\nexit 2\n' > "$T/bin/xcode-select"
+check "xcode-select fails: not found" "$(DEVELOPER_DIR= PATH="$T/bin:$PATH" xc)" no
+
+echo "== no Xcode: emulators still work, simctl never runs (R13, R31)"
+reset
+printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$T/loud.log" > "$T/loud"; chmod +x "$T/loud"; : > "$T/loud.log"
+nox() { DEVELOPER_DIR=$T/empty XCSIM_SIMCTL=$T/loud "$@"; }
+emus Pixel_9
+out=$(nox "$XCSIM" room @Tablet); check "room counts emulators only, never '?'" "$out/$?" "/0"
+out=$(XCQ_MAX_SIMS=1 nox "$XCSIM" room @Tablet); check "limit 1, one emulator on: no room" "$out/$?" "1/1"
+out=$(XCQ_MAX_SIMS=1 nox "$XCSIM" room $U1); check "a simulator target is never exit 76 either" "$out/$?" "1/1"
+out=$(XCQ_SESSION=s1 XCQ_LABEL=alpha nox "$XCSIM" claim @Tablet); check "claim an emulator" "$out/$?" "claimed/0"
+XCQ_SESSION=s1 XCQ_LABEL=alpha XCQ_MAX_SIMS=2 nox "$XCSIM" wait @Tablet; check "wait on a held emulator of ours" $? 0
+XCQ_SESSION=s1 nox "$XCSIM" touch @Tablet; check "touch" $? 0
+XCQ_SESSION=s1 nox "$XCSIM" free @Tablet; check "free" $? 0
+out=$(XCQ_SESSION=s1 XCQ_LABEL=alpha nox "$XCSIM" claim $U1); check "a simulator claim cannot be checked" "$?" 76
+nox "$XCSIM" on $U1; check "a simulator is never on" $? 1
+nox "$XCSIM" restore; check "restore exits 0" $? 0
+check "simctl never ran" "$(cat "$T/loud.log")" ""
+
+echo "== emulators leave ~/.android alone (R16)"
+reset
+H=$T/home; mkdir -p "$H/.android/avd/Pixel_9.avd"
+printf 'avd.ini.encoding=UTF-8\npath=%s\n' "$H/.android/avd/Pixel_9.avd" > "$H/.android/avd/Pixel_9.ini"
+printf 'hw.device.name=pixel_9\n' > "$H/.android/avd/Pixel_9.avd/config.ini"
+snap() { find "$H/.android" -exec stat -f '%N %m %z %p' {} + | sort; find "$H/.android" -type f -exec shasum {} + | sort; }
+before=$(snap)
+emus Pixel_9
+for verb in claim touch room on wait; do HOME=$H as1 $verb @Pixel_9 >/dev/null; done
+HOME=$H as2 claim @Pixel_9 >/dev/null; HOME=$H as1 free @Pixel_9; HOME=$H "$XCSIM" restore
+check "~/.android byte-identical" "$(snap)" "$before"
 
 finish

@@ -1,6 +1,8 @@
 #!/bin/bash
-# xcsim <resolve|claim|touch|free|room|run|restore> ...   simulator leases, one holder per simulator.
-# Lease files: $DIR/leases/<UDID>.lease (key=value lines). Simulator data: `simctl list -j`.
+# xcsim <resolve|claim|touch|free|room|run|restore> ...   device leases, one holder per device.
+# A device is a simulator (its UDID) or an emulator (@ and its AVD name, never renamed: D6).
+# Lease files: $DIR/leases/<UDID|@AVD>.lease (key=value lines). Simulator data: `simctl list -j`
+# (only when Xcode is found); emulators: the process list.
 # Holder = $XCQ_SESSION + $XCQ_AGENT (empty agent = main). A lease whose session has no
 # $DIR/agents/<session>.json is stale and may be taken over.
 # Exit codes: claim 0 claimed/mine, 1 held by other (prints label), 4 reserved,
@@ -18,9 +20,13 @@ session=${XCQ_SESSION:-} agent=${XCQ_AGENT:-main}
 LOCK="🔒"
 
 up() { printf %s "$1" | tr 'a-z' 'A-Z'; }
+is_emu() { case $1 in @*) return 0 ;; esac; return 1; }   # keys are checked on the way in
+key() { if is_emu "$1"; then printf %s "$1"; else up "$1"; fi; }   # UDIDs upper-cased, AVD names as they are
+same_kind() { if is_emu "$1"; then is_emu "$2"; else ! is_emu "$2"; fi; }
+noun() { if is_emu "$1"; then echo emulator; else echo simulator; fi; }
 now_ms() { echo $(( $(date +%s) * 1000 )); }
 lf() { echo "$L/$1.lease"; }
-usage() { echo "usage: xcsim resolve <spec> | claim|touch|free|room|on|wait <UDID> | run <UDID> [--] <command> | restore" >&2; exit 64; }
+usage() { echo "usage: xcsim resolve <spec> | claim|touch|free|room|on|wait <UDID|@AVD> | run <UDID|@AVD> [--] <command> | restore" >&2; exit 64; }
 
 # Turns simctl's JSON into lines: UDID <tab> state <tab> name <tab> OS version <tab> runtime id
 JXA='function run(argv) {
@@ -37,6 +43,7 @@ JXA='function run(argv) {
 }'
 load_sims() {   # fails when simctl or osascript fails, so callers never trust an empty list
   local json
+  has_xcode || return 1   # no Xcode: never run xcrun (D11)
   json=$($SIMCTL list -j 2>/dev/null) || return 1
   SIMS=$(osascript -l JavaScript -e "$JXA" "$json" 2>/dev/null) || return 1
 }
@@ -70,14 +77,14 @@ in_use_by_ticket() {
     a=$(val "$t" agent)
     [ "${a:-main}" = "$agent" ] || continue
     kill -0 "$(val "$t" pid)" 2>/dev/null || continue
-    [ "$(up "$(val "$t" sim)")" = "$1" ] && return 0
+    [ "$(key "$(val "$t" sim)")" = "$1" ] && return 0
   done
   return 1
 }
 
-is_reserved() {  # is_reserved <UDID> <original name>
+is_reserved() {  # is_reserved <UDID|@AVD> <original name, or the AVD name>
   local n
-  grep -qx "$1" "$DIR/reserved" 2>/dev/null && return 0
+  grep -qxF "$1" "$DIR/reserved" 2>/dev/null && return 0
   [ -z "$XCQ_RESERVED_NAMES" ] && return 1
   local IFS=,
   for n in $XCQ_RESERVED_NAMES; do
@@ -121,16 +128,20 @@ free_locked() {
   fi
   orig=$(val "$f" originalName)
   rm -f "$f"
-  [ "$XCQ_RENAME_SIMS" != 0 ] && [ -n "$orig" ] && rename_sim "$u" "$orig"
+  [ "$XCQ_RENAME_SIMS" != 0 ] && [ -n "$orig" ] && ! is_emu "$u" && rename_sim "$u" "$orig"
   return 0
 }
 
 claim_locked() {
   local u=$1 f cur orig tmp other ou
   f=$(lf "$u")
-  load_sims || { echo "cannot read the simulator list"; return 76; }
-  cur=$(sim_field "$u" 3); orig=$(original_of "$cur")
-  [ -z "$orig" ] && orig=$(val "$f" originalName)
+  if is_emu "$u"; then
+    orig=${u#@}   # an emulator: no simulator list, and its name is never changed (D6)
+  else
+    load_sims || { echo "cannot read the simulator list"; return 76; }
+    cur=$(sim_field "$u" 3); orig=$(original_of "$cur")
+    [ -z "$orig" ] && orig=$(val "$f" originalName)
+  fi
   if is_reserved "$u" "$orig"; then echo reserved; return 4; fi
   if [ -e "$f" ]; then
     if mine "$f"; then touch_locked "$u"; echo mine; return 0; fi
@@ -140,31 +151,39 @@ claim_locked() {
   tmp="$L/.tmp.$u.$$"
   write_lease "$tmp" "$u" "$orig" "$(now_ms)" "$(now_ms)"
   mv "$tmp" "$f"
-  for other in "$L"/*.lease; do   # one simulator per holder, unless a live build is using it
+  for other in "$L"/*.lease; do   # one simulator and one emulator per holder, unless a live build uses it
     [ -e "$other" ] || continue
     ou=$(basename "$other" .lease)
-    [ "$ou" != "$u" ] && mine "$other" && ! in_use_by_ticket "$ou" && free_locked "$ou"
+    [ "$ou" != "$u" ] && same_kind "$ou" "$u" && mine "$other" && ! in_use_by_ticket "$ou" && free_locked "$ou"
   done
-  if [ "$XCQ_RENAME_SIMS" != 0 ] && [ -n "$orig" ]; then
+  if [ "$XCQ_RENAME_SIMS" != 0 ] && [ -n "$orig" ] && ! is_emu "$u"; then
     rename_sim "$u" "$LOCK $(printf %s "${XCQ_LABEL:-agent}" | tr '\n' ' ' | sed 's/ · / - /g') · $orig"
   fi
   echo claimed
 }
 
-cmd_touch() { with_lock "$(up "$1")" touch_locked; }
-cmd_free() { local u; u=$(up "$1"); shift; with_lock "$u" free_locked "$@"; }   # free <UDID> [--force ...]
-cmd_claim() { with_lock "$(up "$1")" claim_locked; }
+cmd_touch() { with_lock "$(key "$1")" touch_locked; }
+cmd_free() { local u; u=$(key "$1"); shift; with_lock "$u" free_locked "$@"; }   # free <key> [--force ...]
+cmd_claim() { with_lock "$(key "$1")" claim_locked; }
 
-cmd_on() {  # on <UDID>: 0 when the simulator is Booted or Booting
-  load_sims && is_on "$(up "$1")"
+cmd_on() {  # on <key>: 0 when the simulator is Booted or Booting, or the emulator is running
+  local u
+  u=$(key "$1")
+  if is_emu "$u"; then emu_on "${u#@}"; else load_sims && is_on "$u"; fi
 }
 
+# room <key>: 0 when the device is on or one more fits under the shared limit; else prints how many
+# are on (simulators, counted only when Xcode is found, plus emulators), or "?" when unknown.
 cmd_room() {
-  local u on
-  u=$(up "$1")
-  load_sims || { echo "?"; return 1; }
-  is_on "$u" && return 0
-  on=$(printf '%s\n' "$SIMS" | awk -F'\t' '$2=="Booted"||$2=="Booting"' | wc -l | tr -d ' ')
+  local u on=0
+  u=$(key "$1")
+  is_emu "$u" && emu_on "${u#@}" && return 0
+  if has_xcode; then
+    load_sims || { echo "?"; return 1; }
+    ! is_emu "$u" && is_on "$u" && return 0
+    on=$(printf '%s\n' "$SIMS" | awk -F'\t' '$2=="Booted"||$2=="Booting"' | wc -l | tr -d ' ')
+  fi
+  on=$(( on + $(emu_count) ))
   [ "$on" -lt "$MAX_SIMS" ] && return 0
   echo "$on"; return 1
 }
@@ -217,18 +236,19 @@ EOT
   return 0
 }
 
-cmd_wait() {  # wait <UDID>: returns 0 once the simulator is ours and there is room
-  local u out rc msg last=
-  u=$(up "$1")
+cmd_wait() {  # wait <key>: returns 0 once the device is ours and there is room
+  local u out rc msg last= n
+  u=$(key "$1"); n=$(noun "$u")
   while :; do
     sim_active || return 0   # simaphore is off: nothing to wait for
     out=$(cmd_claim "$u"); rc=$?
     case $rc in
-      0) out=$(cmd_room "$u") && { [ -n "$last" ] && echo "xcsim: simulator free, running"; return 0; }
-         msg="xcsim: $out simulators on, waiting for room" ;;
-      1) msg="xcsim: simulator held by $out" ;;
+      0) out=$(cmd_room "$u") && { [ -n "$last" ] && echo "xcsim: $n free, running"; return 0; }
+         msg="xcsim: $out simulators on, waiting for room"
+         is_emu "$u" && msg="xcsim: $out devices on, waiting for room" ;;   # the limit is shared (D1)
+      1) msg="xcsim: $n held by $out" ;;
       *) case $rc in
-           4) echo "xcsim: simulator is reserved" ;;
+           4) echo "xcsim: $n is reserved" ;;
            76) echo "xcsim: cannot read the simulator list" ;;
            *) echo "xcsim: claim failed (exit $rc)" ;;
          esac
@@ -242,9 +262,9 @@ cmd_wait() {  # wait <UDID>: returns 0 once the simulator is ours and there is r
 child=
 run_cleanup() { [ -n "$child" ] && killtree "$child"; }
 
-cmd_run() {  # run <UDID> -- prog args...   |   run <UDID> <command-string>
+cmd_run() {  # run <key> -- prog args...   |   run <key> <command-string>
   local u argv=0 rc
-  u=$(up "$1"); shift
+  u=$(key "$1"); shift
   if [ "$1" = -- ]; then argv=1; shift; fi
   [ $# -lt 1 ] && usage
   cmd_wait "$u" || return $?
@@ -267,7 +287,7 @@ case $sub in
 esac
 case $sub in
   resolve|restore) ;;
-  *) is_uuid "$1" || { echo "xcsim: not a simulator ID: $1" >&2; exit 64; } ;;
+  *) is_uuid "$1" || is_avd_key "$1" || { echo "xcsim: not a simulator ID: $1" >&2; exit 64; } ;;
 esac
 mkdir -p "$L" 2>/dev/null && [ -w "$L" ] || { echo "xcsim: cannot write lease folder $L" >&2; exit 74; }
 "cmd_$sub" "$@"

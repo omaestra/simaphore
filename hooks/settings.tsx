@@ -10,13 +10,13 @@ export type Field =
   | { key: string; label: string; help: string; kind: 'toggle'; def: boolean }
 
 export const FIELDS: Field[] = [
-  { key: 'maxSims', label: 'Simulator limit', help: 'Most simulators on at once. A command that needs one more waits for room.', kind: 'number', def: 2, min: 1, max: 12, step: 1 },
+  { key: 'maxSims', label: 'Simulator and emulator limit', help: 'Most simulators and emulators on at once; one more waits for room.', kind: 'number', def: 2, min: 1, max: 12, step: 1 },
   { key: 'maxBuilds', label: 'Builds at once', help: 'How many agent builds may run together when memory is fine.', kind: 'number', def: 2, min: 1, max: 8, step: 1 },
-  { key: 'buildJobs', label: 'Compiler jobs', help: 'Added as -jobs to a build that has none. Lower is gentler on the Mac.', kind: 'number', def: 6, min: 1, max: 16, step: 1 },
+  { key: 'buildJobs', label: 'Compiler jobs', help: '-jobs for Xcode, --max-workers for Gradle, when missing. Lower is gentler.', kind: 'number', def: 6, min: 1, max: 16, step: 1 },
   { key: 'swapPercent', label: 'Memory is tight at', help: 'Swap used, as a percent of swap total. Past it, one build at a time.', kind: 'number', def: 85, min: 50, max: 100, step: 5, unit: '%' },
   { key: 'idleMinutes', label: 'Simulator is idle after', help: 'Minutes under 2% CPU before a simulator counts as idle.', kind: 'number', def: 10, min: 1, max: 120, step: 1, unit: ' min' },
   { key: 'lowDiskGb', label: 'Warn below free disk', help: 'The panel warns when free disk space is under this many GB.', kind: 'number', def: 20, min: 1, max: 500, step: 5, unit: ' GB' },
-  { key: 'renameSims', label: 'Rename held simulators', help: 'Show who has a simulator in its name, such as "🔒 feature-x · Bench 2".', kind: 'toggle', def: true },
+  { key: 'renameSims', label: 'Rename held simulators', help: 'iOS only. Shows the holder in the name, such as "🔒 feature-x · Bench 2".', kind: 'toggle', def: true },
   { key: 'asciiSymbols', label: 'Plain symbols', help: 'Draw > + x * instead of the check, cross and dot symbols.', kind: 'toggle', def: false },
 ]
 
@@ -58,7 +58,7 @@ export type SettingsActions = {
 export type SettingsInput = {
   values: Values
   reservedSims: string
-  /** Names of the simulators this Mac has. */
+  /** Names of the simulators this Mac has, and of the emulators (AVDs) that are on. */
   simNames: string[]
   columns: number
   isMono: boolean
@@ -72,7 +72,8 @@ const valueText = (f: Field, v: number | boolean) => (f.kind === 'toggle' ? (v ?
 
 export function drawSettings(ui: Ui, p: SettingsInput) {
   const { Box, Text, Button } = ui
-  const labelW = Math.min(26, Math.max(14, Math.floor(p.columns / 3)))
+  // 29 fits the longest label, "Simulator and emulator limit", from 80 columns.
+  const labelW = Math.min(29, Math.max(14, Math.floor((p.columns * 3) / 8)))
   const valueW = 9
   const reserved = namesOf(p.reservedSims)
   const sims = [...new Set([...p.simNames, ...reserved])].sort()
@@ -109,7 +110,7 @@ export function drawSettings(ui: Ui, p: SettingsInput) {
       })}
       <Text> </Text>
       <Text> Your simulators</Text>
-      <Text dimColor>   {clipCells('Agents never get these. Press one to mark it.', p.columns - 4)}</Text>
+      <Text dimColor>   {clipCells('Agents never get these, iOS or Android (AVD names). Press one to mark it.', p.columns - 4)}</Text>
       {sims.length === 0 && <Text dimColor>   No simulators found yet.</Text>}
       {sims.map(name => (
         <Box key={`sim-${name}`}>
