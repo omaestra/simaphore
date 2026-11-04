@@ -71,3 +71,10 @@ test('recordSlot adds a slot, skips a too-close sample, and never exceeds 200', 
   expect(ring).toHaveLength(SLOT_COUNT)
   expect(ring![ring!.length - 1]!.at).toBe(NOW + (SLOT_COUNT + 49) * 3000)
 })
+
+test('recordSlot keeps an on-time beat that follows a late one', () => {
+  const late = rec(NOW + 3600, rec(NOW))
+  const onTime = rec(NOW + 6000, late)
+  expect(onTime).toHaveLength(3)
+  expect(rec(NOW + 7400, onTime)).toBe(onTime)
+})

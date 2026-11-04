@@ -1,5 +1,5 @@
 // The last ten minutes as a ring of 3-second slots, so the panel can draw who did what when.
-// Pure: the sampler (register.tsx) calls recordSlot once per sample and stores the result.
+// Pure: the sampler (register.tsx) calls recordSlot once per 3-second timer beat and stores the result.
 import type { AgentRecord, Snapshot, Ticket, TimelineSlot } from '../types'
 import { OWNER_COLOR, agentColor, isUsing, orderQueue } from './logic'
 import { TEST_KINDS, findSim } from './rows'
@@ -7,7 +7,7 @@ import { TEST_KINDS, findSim } from './rows'
 export const SLOT_MS = 3000
 export const SLOT_COUNT = 200
 /** A sample closer than this to the last slot adds nothing. */
-const MIN_GAP_MS = 2500
+const MIN_GAP_MS = SLOT_MS / 2
 
 export const BOOT = '░'
 export const BUILD = '█'

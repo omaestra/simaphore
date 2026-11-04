@@ -783,6 +783,12 @@ export const register: Register = (on, options) => {
     const topRead = sideRead(() => run(['top', '-l', '1', '-stats', 'pid,mem'], 20_000), wakeIfAnswered)
     const simsRead = sideRead(() => run(['xcrun', 'simctl', 'list', '-j']), () => wake())
     const thermRead = sideRead(() => run(['pmset', '-g', 'therm'], THERM_TIMEOUT_MS), wakeIfAnswered)
+    // Answers that come back while this session isn't sampling would be old by the next sample.
+    const dropSideReads = () => {
+      topRead.take()
+      simsRead.take()
+      thermRead.take()
+    }
 
     // `isBeat`: the 3-second timer's tick, the only one that adds a timeline column.
     const sample = async (now: number, queue: Ticket[], agents: AgentRecord[], isBeat: boolean) => {
@@ -797,6 +803,14 @@ export const register: Register = (on, options) => {
       const isSlowDue = now - lastSlow >= SLOW_EVERY_MS
       const isBooting = bootWatch.size > 0 || [...(sims?.values() ?? [])].some(s => s.state === 'Booting')
       const simsEveryMs = isBooting ? SIMS_BOOTING_EVERY_MS : isWatching ? SIMS_WATCHED_EVERY_MS : SIMS_EVERY_MS
+      // Take the answers first: `lastTop` must be current before the check, or `top` starts twice.
+      const top = topRead.take()
+      const simAnswer = simsRead.take()
+      const therm = thermRead.take()
+      if (top && top.text !== '') {
+        topMem = parseTop(top.text)
+        lastTop = top.at
+      }
       if (!isHeavy && now - lastTop >= TOP_EVERY_MS) topRead.start(now)
       // A stale list waits for a read that starts after the event, not one already going.
       if ((isSimsStale || now - lastSims >= simsEveryMs) && simsRead.start(now)) {
@@ -804,19 +818,12 @@ export const register: Register = (on, options) => {
         lastSims = now
       }
       if (now - lastTherm >= THERM_EVERY_MS && thermRead.start(now)) lastTherm = now
-      const top = topRead.take()
-      const simAnswer = simsRead.take()
-      const therm = thermRead.take()
       const [psOut, pausedPids] = await Promise.all([run(['ps', '-Ao', 'pid=,ppid=,%cpu=,rss=,etime=,command=']), paused()])
       quietUntil = quietUntilAfter(now, lastSampleAt, quietUntil)
       lastSampleAt = now
 
       const procs = parsePs(psOut)
       await keepReserved(now, procs).catch(() => undefined)
-      if (top && top.text !== '') {
-        topMem = parseTop(top.text)
-        lastTop = top.at
-      }
       if (simAnswer) {
         const simOut = simAnswer.text
         const isGood = isSimctlAnswer(simOut)
@@ -989,6 +996,7 @@ export const register: Register = (on, options) => {
         isOn = (await syncPanels()) ?? isOn
         if (!isOn) {
           await goQuiet(wasOn)
+          dropSideReads()
 
           return
         }
@@ -1003,6 +1011,7 @@ export const register: Register = (on, options) => {
         } else {
           wasLeader = false
           stopAppStreams()
+          dropSideReads()
           const raw = await readJson<Snapshot>('latest.json')
           snap = raw ? normalizeSnapshot(raw) : null
         }

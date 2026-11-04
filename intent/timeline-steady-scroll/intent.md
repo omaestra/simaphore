@@ -101,4 +101,6 @@ how much time fits in the panel's width.
 - S2 (R4): In the same panel, make the pane narrower and wider. The heading's time follows the width.
 
 ## Departures
-- none
+- Review fixes (R1, R7): `hooks/timeline.ts` skips a slot only under 1.5 s after the last one
+  (was 2.5 s), so a beat that ran late no longer drops the next one. `top` is read once per 10 s
+  again, and answers that come back while a session isn't sampling are thrown away.
