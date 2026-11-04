@@ -1,6 +1,7 @@
 # Intent: timeline-steady-scroll
 
 Authored: 2026-11-04 · branch: feature/timeline-steady-scroll · tier: medium · captured: /intent
+Revised: 2026-11-04 · R7, D5 and P4 added after the live check, at the owner's request
 
 ## Problem
 > The simaphore timeline updates behaves strangely with no recognizable pattern, lets improve the
@@ -15,6 +16,14 @@ everything jumps one column, every 3 or 4 ticks. The column edges are counted ba
 redraw time, so slots regroup on every tick and a block grows or shrinks by a cell as it moves. And
 the panel redraws for the mascot every 0.4 s while an agent is busy, each time with a new clock, so
 the jumps land at random moments between ticks.
+
+> maybe 1 second ticks is not the right way to go, but steadiness is. We can adjust the intervals
+> later
+
+The live check of R1–R6 found the moves still come 1.8 to 4.2 s apart. Every 4th tick waits for
+`top` (about 0.8 s), so its column shows up a second late and the next one seems early. An update
+started by an event can also add a column early, or be running when the timer fires and make it
+skip a tick.
 
 ## Outcome
 Every 3-second tick moves the whole timeline exactly one column to the left, with the new tick on the
@@ -42,6 +51,11 @@ how much time fits in the panel's width.
 - R5: A simulator gets a lane only if it shows up within the time on screen.
 - R6: README.md, docs/how-it-works.md and the screenshots in docs/images/ describe and show the new
   timeline.
+- R7: The timeline moves at an even pace: each tick is on screen within 0.5 s of when it was taken,
+  so the moves come 2.5 to 3.5 s apart however busy the Mac is. Reads that run only now and then
+  (memory per app, the simulator list, heat) never hold a tick back. A tick that is due while another
+  update is running waits for it instead of being skipped. Only the 3-second timer adds a column; an
+  early update started by an event refreshes the rest of the panel, not the timeline.
 
 ## Decisions
 - D1: One column per recorded tick — beat: 10-minute buckets fixed to the clock; that plus a zoom key;
@@ -56,12 +70,19 @@ how much time fits in the panel's width.
 - D4: The heading reads "the last N min, newest on the right" (whole minutes rounded down; seconds
   under a minute) — beat: keeping "the last 10 minutes" — why: that would be wrong at almost every
   width. The owner may change the wording.
+- D5: Slow reads run on their own and each tick uses their last answer — beat: 1-second ticks; a
+  steady sender in `bin/xcwatch` that reads the numbers itself on a fixed timer — why: the owner
+  wants steadiness now and the intervals tuned later, and this is the smallest change that gives
+  it. It is the pattern the sampler already uses for disk sizes and running apps (`refreshHost`,
+  `refreshApps`). An answer that comes back starts an early update, so it shows as soon as today.
 
 ## Out of scope
 - A zoom key or a 10-minute view (the "A plus zoom" option); a possible follow-up.
 - How often ticks are recorded, and how many are kept.
 - Idle and switched-off simulators both being drawn as `·`.
 - Panels in other sessions reading the recorder's file on their own 3 s timer.
+- 1-second ticks, other read intervals, and a steady sender in `bin/xcwatch`: the intervals can be
+  tuned later.
 
 ## Steps
 | Step | Serves | Files | Tests |
@@ -69,12 +90,14 @@ how much time fits in the panel's width.
 | P1 | R1, R3, R5 | `hooks/model.ts` (`timelineLanes`: one column per tick, placed back from the newest tick; no `now`) | `hooks/model.test.ts` (extended: shift by one with jitter, width kept, gap gives empty columns, lanes only for sims in view) |
 | P2 | R2, R4, R5 | `hooks/screen.tsx` (`timelineSegs`, `Timeline`: label width from the lanes in view, heading with the time shown) | `hooks/screen.test.ts` (extended: heading per width; two redraws within one tick draw the same timeline) |
 | P3 | R6 | `hooks/demo.fixture.ts` (busy spans short enough that quiet-then-busy shows in about 3 minutes), `hooks/screen.snapshots.ts` (regenerated), `README.md`, `docs/how-it-works.md`, `docs/images/*.svg` (via `scripts/shots.sh`) | `hooks/screen.snapshot.test.ts`, `hooks/demo.test.ts` |
+| P4 | R7 | `hooks/register.tsx` (`top`, `simctl list` and `pmset` run on their own; only the timer's tick adds a column; a tick due during another update runs right after it), `hooks/sideread.ts` (new) | `hooks/sideread.test.ts` (new: one read at a time, each answer taken once, an empty answer passed on, a read that throws gives none) |
 
 ## Scenarios to prove
 - S1 (R1, R2): Load this checkout with `claude --plugin-dir <path>` and a throwaway `SIMAPHORE_DIR`,
   open `/simaphore`, and have an agent build or drive a spare simulator so the mascot moves. For about
   30 s, every 3 s the whole timeline moves one column left, nothing moves in between, and a build
-  block keeps its width.
+  block keeps its width. (R7) The moves come 2.5 to 3.5 s apart, each within 0.5 s of its tick,
+  including the ticks when `top` and the simulator list are read.
 - S2 (R4): In the same panel, make the pane narrower and wider. The heading's time follows the width.
 
 ## Departures
