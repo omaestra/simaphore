@@ -92,6 +92,7 @@ import type { Theme } from './mascot'
 import { drawScreen } from './screen'
 import { titleOf, workRows } from './rows'
 import { recordSlot } from './timeline'
+import { sideRead } from './sideread'
 import {
   appStatesOfLines,
   isWake,
@@ -773,7 +774,18 @@ export const register: Register = (on, options) => {
       }
     }
 
-    const sample = async (now: number, queue: Ticket[], agents: AgentRecord[]) => {
+    // `top` (about 0.8 s), the simulator list and heat run on their own, so a tick never waits for
+    // them and the timeline keeps its beat. An answer starts an early update that uses it at once.
+    // A failed simulator read wakes it too, to count the failure; the other two just try again.
+    const wakeIfAnswered = (answer: { text: string }) => {
+      if (answer.text !== '') wake()
+    }
+    const topRead = sideRead(() => run(['top', '-l', '1', '-stats', 'pid,mem'], 20_000), wakeIfAnswered)
+    const simsRead = sideRead(() => run(['xcrun', 'simctl', 'list', '-j']), () => wake())
+    const thermRead = sideRead(() => run(['pmset', '-g', 'therm'], THERM_TIMEOUT_MS), wakeIfAnswered)
+
+    // `isBeat`: the 3-second timer's tick, the only one that adds a timeline column.
+    const sample = async (now: number, queue: Ticket[], agents: AgentRecord[], isBeat: boolean) => {
       if (!wasLeader) {
         last = (await readJson<Snapshot>('latest.json')) ?? last
       }
@@ -782,36 +794,35 @@ export const register: Register = (on, options) => {
       const sysctl = parseSysctl(sysOut)
       // Under heavy load `top` itself is slow and adds to the problem.
       const isHeavy = cores > 0 && (sysctl.load[0] ?? 0) > 3 * cores
-      const isTopDue = !isHeavy && now - lastTop >= TOP_EVERY_MS
       const isSlowDue = now - lastSlow >= SLOW_EVERY_MS
       const isBooting = bootWatch.size > 0 || [...(sims?.values() ?? [])].some(s => s.state === 'Booting')
       const simsEveryMs = isBooting ? SIMS_BOOTING_EVERY_MS : isWatching ? SIMS_WATCHED_EVERY_MS : SIMS_EVERY_MS
-      const isSimsDue = isSimsStale || now - lastSims >= simsEveryMs
-      if (isSimsDue) isSimsStale = false
-      const isThermDue = now - lastTherm >= THERM_EVERY_MS
-      const [psOut, topOut, simOut, pausedPids, thermOut] = await Promise.all([
-        run(['ps', '-Ao', 'pid=,ppid=,%cpu=,rss=,etime=,command=']),
-        isTopDue ? run(['top', '-l', '1', '-stats', 'pid,mem'], 20_000) : Promise.resolve(''),
-        isSimsDue ? run(['xcrun', 'simctl', 'list', '-j']) : Promise.resolve(''),
-        paused(),
-        isThermDue ? run(['pmset', '-g', 'therm'], THERM_TIMEOUT_MS) : Promise.resolve(''),
-      ])
-      if (isThermDue) lastTherm = now
+      if (!isHeavy && now - lastTop >= TOP_EVERY_MS) topRead.start(now)
+      // A stale list waits for a read that starts after the event, not one already going.
+      if ((isSimsStale || now - lastSims >= simsEveryMs) && simsRead.start(now)) {
+        isSimsStale = false
+        lastSims = now
+      }
+      if (now - lastTherm >= THERM_EVERY_MS && thermRead.start(now)) lastTherm = now
+      const top = topRead.take()
+      const simAnswer = simsRead.take()
+      const therm = thermRead.take()
+      const [psOut, pausedPids] = await Promise.all([run(['ps', '-Ao', 'pid=,ppid=,%cpu=,rss=,etime=,command=']), paused()])
       quietUntil = quietUntilAfter(now, lastSampleAt, quietUntil)
       lastSampleAt = now
 
       const procs = parsePs(psOut)
       await keepReserved(now, procs).catch(() => undefined)
-      if (isTopDue && topOut !== '') {
-        topMem = parseTop(topOut)
-        lastTop = now
+      if (top && top.text !== '') {
+        topMem = parseTop(top.text)
+        lastTop = top.at
       }
-      if (isSimsDue) {
-        lastSims = now
+      if (simAnswer) {
+        const simOut = simAnswer.text
         const isGood = isSimctlAnswer(simOut)
         simctlFailCount = simctlFails(simctlFailCount, isGood)
         simctl = simctlStatus(simctlFailCount, now)
-        if (isGood) simList = { at: now, text: simOut }
+        if (isGood) simList = { at: simAnswer.at, text: simOut }
         if (isGood) sims = parseSimctl(simOut)
         if (isGood) allSims = parseSimctl(simOut, true)
         if (isGood && sims) watchBoot(sims)
@@ -854,7 +865,7 @@ export const register: Register = (on, options) => {
         savedDestination: ws => savedDestOf.get(ws)?.udid,
         paused: pausedPids,
         xcodeVersions: new Map([...versionOfApp].filter(([, v]) => v !== '')),
-        thermal: thermOut === '' ? undefined : parseTherm(thermOut),
+        thermal: therm && therm.text !== '' ? parseTherm(therm.text) : undefined,
         results: await readResults(now),
         isQueuePaused: await isPaused(),
         simctl,
@@ -867,13 +878,16 @@ export const register: Register = (on, options) => {
       snap.agentUsedAt = Object.fromEntries(usedAt)
       refreshHost(now, snap.host)
       await addBranches(snap, now)
-      snap.timeline = recordSlot(last?.timeline, {
-        snap,
-        agents,
-        queue,
-        score: pressure(snap, settings).score,
-        booted: bootedCount(snap),
-      })
+      // An early update refreshes the rest of the panel; the timeline moves on the beat only.
+      snap.timeline = isBeat
+        ? recordSlot(last?.timeline, {
+          snap,
+          agents,
+          queue,
+          score: pressure(snap, settings).score,
+          booted: bootedCount(snap),
+        })
+        : (last?.timeline ?? [])
       last = snap
       await syncHold(snap)
       await $.fs.write(`${dir}/latest.json`, JSON.stringify(snap))
@@ -903,6 +917,8 @@ export const register: Register = (on, options) => {
     let lastTickAt = 0
     let isWakePending = false
     let isRerunWanted = false
+    // The timer fired while another update ran: its beat runs as soon as that one ends.
+    let isBeatWanted = false
 
     // Keeps this session's panel file in step with its pane, clears files of sessions that are gone,
     // and answers whether simaphore is on. Undefined when `ps` failed: keep the last answer.
@@ -960,8 +976,12 @@ export const register: Register = (on, options) => {
       }
     }
 
-    const tick = async () => {
-      if (isBusy) return
+    const tick = async (isBeat = false) => {
+      if (isBusy) {
+        if (isBeat) isBeatWanted = true
+
+        return
+      }
       isBusy = true
       lastTickAt = Date.now()
       try {
@@ -978,7 +998,7 @@ export const register: Register = (on, options) => {
         const agents = await readAgents(now)
         let snap: Snapshot | null
         if (await claimLeader(now)) {
-          snap = await sample(now, queue, agents)
+          snap = await sample(now, queue, agents, isBeat)
           wasLeader = true
         } else {
           wasLeader = false
@@ -1003,7 +1023,11 @@ export const register: Register = (on, options) => {
         // a failed tick is retried by the next one
       } finally {
         isBusy = false
-        if (isRerunWanted) {
+        if (isBeatWanted) {
+          isBeatWanted = false
+          isRerunWanted = false
+          void tick(true)
+        } else if (isRerunWanted) {
           isRerunWanted = false
           wake()
         }
@@ -1149,9 +1173,9 @@ export const register: Register = (on, options) => {
     }
 
     kick = wake
-    $.clock.every(TICK_MS, () => void tick())
+    $.clock.every(TICK_MS, () => void tick(true))
     $.clock.every(HEARTBEAT_MS, () => void heartbeat())
-    void tick()
+    void tick(true)
 
     // Build the helper in the background; without it everything keeps polling.
     void $.process.run([xcwatch, 'build'], { env: { SIMAPHORE_DIR: dir }, timeoutMs: BUILD_WATCHER_TIMEOUT_MS })

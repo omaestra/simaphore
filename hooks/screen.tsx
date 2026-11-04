@@ -12,6 +12,7 @@ import { PHONE_HEIGHT, PHONE_WIDTH, phoneRows } from './phone'
 import { CARD_MASCOT_WIDTH, MASCOT_WIDTH, mascotRows } from './mascot'
 import type { Pose, Segment, Theme } from './mascot'
 import { cellWidth, clipCells, elapsedText, fitCells, padCells, sizeText } from './text'
+import { SLOT_COUNT, SLOT_MS } from './timeline'
 import type { AgentRow, Alert, QueueRow, SimCard, SimRow, SimTone } from './model'
 
 export type Ui = Pick<Elements['terminal'], 'Box' | 'Text' | 'Button'>
@@ -598,16 +599,27 @@ function trackLine(label: string, labelW: number, cells: Seg[]): Seg[] {
   return [dim(labelCell(label, labelW)), ...cells]
 }
 
-function timelineSegs(c: Ctx): Seg[][] {
-  const { snap, now } = c.p.input
+/** How long `columns` ticks cover: whole minutes rounded down, or seconds under a minute. */
+export function timelineSpanText(columns: number): string {
+  const seconds = (columns * SLOT_MS) / 1000
+
+  return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min`
+}
+
+/** The timeline's rows, and how many ticks wide its lanes are. */
+function timelineView(c: Ctx): { lines: Seg[][]; columns: number } {
+  const { snap } = c.p.input
   const { settings, sims } = c.model
   const timeline = snap.timeline ?? []
   const labelOf = (udid: string) => laneLabel(sims.find(x => x.udid === udid), udid)
   const tracks = [`budget ${settings.maxSims}`, 'queue', 'pressure']
-  const names = timelineLanes(timeline, 1, now, settings.maxSims).lanes.map(l => labelOf(l.udid))
+  // One tick per column, never more columns than ticks kept; the right edge stays put on screen.
+  const laneWidthFor = (labelW: number) => Math.min(SLOT_COUNT, Math.max(LANE_MIN_W, c.width - labelW - LANE_OWNER_W))
+  // Size the labels to the simulators on screen at the narrowest lane, then draw at the width left.
+  const names = timelineLanes(timeline, laneWidthFor(LANE_LABEL_MAX_W), settings.maxSims).lanes.map(l => labelOf(l.udid))
   const labelW = laneLabelWidth([...names, ...tracks], c.width)
-  const laneW = Math.max(LANE_MIN_W, c.width - labelW - LANE_OWNER_W)
-  const t = timelineLanes(timeline, laneW, now, settings.maxSims)
+  const laneW = laneWidthFor(labelW)
+  const t = timelineLanes(timeline, laneW, settings.maxSims)
   const lanes = t.lanes.map((lane): Seg[] => {
     const sim = sims.find(x => x.udid === lane.udid)
     const owner = sim?.owner
@@ -622,22 +634,25 @@ function timelineSegs(c: Ctx): Seg[][] {
   const budget = runsOf(t.overBudget.map(o => (o ? '━' : '─')), t.overBudget.map(o => (o ? { color: RED } : {})))
   const queue = t.queue.map(n => (n === 0 ? '·' : n > 9 ? '+' : String(n)))
 
-  return [
+  const lines = [
     ...lanes,
     trackLine(tracks[0]!, labelW, budget),
     trackLine('queue', labelW, [seg(queue.join(''))]),
     trackLine('pressure', labelW, pressureRuns(t.pressure, t.pressureScores)),
     legendSegs(),
   ]
+
+  return { lines, columns: laneW }
 }
 
 function Timeline(c: Ctx) {
   const { Box } = c.ui
+  const { lines, columns } = timelineView(c)
 
   return (
     <Box flexDirection="column">
-      <Section c={c} title="TIMELINE" about="the last 10 minutes, newest on the right" />
-      {timelineSegs(c).map((l, i) => <Line key={`t${i}`} c={c} segs={l} />)}
+      <Section c={c} title="TIMELINE" about={`the last ${timelineSpanText(columns)}, newest on the right`} />
+      {lines.map((l, i) => <Line key={`t${i}`} c={c} segs={l} />)}
     </Box>
   )
 }
