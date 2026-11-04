@@ -191,6 +191,11 @@ session ending, or memory pressure. Waiters and the panel then react at once
 instead of on the next timer. The first session builds it once with `swiftc`
 into the simaphore folder, in the background.
 
+The slow reads (memory per app from `top`, the simulator list, heat) run on
+their own and never hold a tick back, so the timeline moves at an even beat.
+Each tick uses their last answer, and an answer that comes back refreshes the
+panel at once. Only the 3-second timer adds a timeline column.
+
 Polling stays as the safety net. Without the helper (no `swiftc`, or the build
 fails) everything polls as before, just a few seconds later. With it, the
 timed simulator list read drops from every 10 s to every 30 s.
