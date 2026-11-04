@@ -352,43 +352,99 @@ const slot = (secAgo: number, o: Partial<TimelineSlot> = {}): TimelineSlot => ({
 })
 
 test('timelineLanes: nothing recorded gives empty columns', () => {
-  const t = timelineLanes([], 10, NOW, 2)
+  const t = timelineLanes([], 10, 2)
   expect(t.lanes).toEqual([])
   expect(t.pressure).toBe(' '.repeat(10))
   expect(t.overBudget.every(x => !x)).toBe(true)
 })
 
-test('timelineLanes: a lane per sim seen, ' + 'blank where it was not booted', () => {
-  const slots = [slot(590, { sims: { u1: ['·'] } }), slot(10, { sims: { u1: ['█', '#fff'], u2: ['░'] } })]
-  const t = timelineLanes(slots, 10, NOW, 2)
-  expect(t.lanes.map(l => l.udid)).toEqual(['u1', 'u2'])
-  const u1 = t.lanes[0]!
-  expect(u1.cells[0]).toBe('·')
-  expect(u1.cells[9]).toBe('█')
-  expect(u1.colors[9]).toBe('#fff')
-  expect(u1.cells[5]).toBe(' ')
-  expect(t.lanes[1]!.cells[0]).toBe(' ')
+test('timelineLanes: one column per tick, the newest on the right', () => {
+  const slots = [slot(9, { sims: { u: ['·'] } }), slot(6, { sims: { u: ['░'] } }), slot(3, { sims: { u: ['█', '#fff'] } }), slot(0, { sims: { u: ['▓'] } })]
+  const t = timelineLanes(slots, 6, 2)
+  expect(t.lanes[0]!.cells).toEqual([' ', ' ', '·', '░', '█', '▓'])
+  expect(t.lanes[0]!.colors[4]).toBe('#fff')
 })
 
-test('timelineLanes: build beats test beats drive beats boot beats idle in one column', () => {
-  const order = ['·', '░', '▒', '▓', '█']
-  for (let i = 0; i < order.length; i++) {
-    const slots = order.slice(0, i + 1).map((c, k) => slot(9 - k, { sims: { u: [c] } }))
-    expect(timelineLanes(slots, 1, NOW, 2).lanes[0]!.cells[0]).toBe(order[i])
+test('timelineLanes: a lane per sim on screen, blank where it was not booted', () => {
+  const slots = [slot(6, { sims: { u1: ['·'] } }), slot(3, { sims: {} }), slot(0, { sims: { u1: ['█'], u2: ['░'] } })]
+  const t = timelineLanes(slots, 3, 2)
+  expect(t.lanes.map(l => l.udid)).toEqual(['u1', 'u2'])
+  expect(t.lanes[0]!.cells).toEqual(['·', ' ', '█'])
+  expect(t.lanes[1]!.cells).toEqual([' ', ' ', '░'])
+})
+
+test('timelineLanes: a sim seen only before the time on screen gets no lane', () => {
+  const slots = [slot(30, { sims: { old: ['█'] } }), ...[12, 9, 6, 3, 0].map(s => slot(s, { sims: { now: ['·'] } }))]
+  expect(timelineLanes(slots, 5, 2).lanes.map(l => l.udid)).toEqual(['now'])
+  expect(timelineLanes(slots, 20, 2).lanes.map(l => l.udid)).toEqual(['now', 'old'])
+})
+
+test('timelineLanes: each column shows its own tick’s pressure, budget and queue', () => {
+  const t = timelineLanes([slot(3, { p: 20 }), slot(0, { p: 90, b: 3, q: [1, 2] })], 3, 2)
+  expect(t.pressure).toBe(' ▂█')
+  expect(t.pressureScores).toEqual([undefined, 20, 90])
+  expect(t.overBudget).toEqual([false, false, true])
+  expect(t.queue).toEqual([0, 0, 2])
+})
+
+// Ticks 2.5 to 3.5 s apart, as the recorder makes them, with something different in each.
+const jittered = (count: number): TimelineSlot[] => {
+  const gaps = [3.0, 2.5, 3.5, 2.6, 3.4, 3.1, 2.9, 2.5, 3.5, 3.0, 2.7, 3.3]
+  const kinds = ['·', '░', '█', '█', '█', '▓', '▓', '▒', '·']
+  let at = NOW - 3_600_000
+
+  return Array.from({ length: count }, (_, i) => {
+    at += gaps[i % gaps.length]! * 1000
+    const sims: TimelineSlot['sims'] = { u: [kinds[i % kinds.length]!] }
+    if (i % 7 < 3) sims.v = ['▒', '#abc']
+
+    return { at, sims, p: (i * 37) % 100, b: i % 5 === 0 ? 3 : 1, ...(i % 4 === 0 ? { q: [i] } : {}) }
+  })
+}
+
+/** Everything drawn in one column as text, so two timelines can be compared column by column. */
+const columnsOf = (t: ReturnType<typeof timelineLanes>, udids: string[]) =>
+  t.pressure.split('').map((p, i) => [
+    ...udids.map(u => {
+      const lane = t.lanes.find(l => l.udid === u)
+
+      return `${lane?.cells[i] ?? ' '}${lane?.colors[i] ?? ''}`
+    }),
+    p, t.pressureScores[i], t.overBudget[i], t.queue[i],
+  ].join('|'))
+
+test('timelineLanes: every new tick moves every mark exactly one column left', () => {
+  const ring = jittered(120)
+  const width = 40
+  for (let k = 1; k < ring.length; k++) {
+    const before = columnsOf(timelineLanes(ring.slice(0, k), width, 2), ['u', 'v'])
+    const after = columnsOf(timelineLanes(ring.slice(0, k + 1), width, 2), ['u', 'v'])
+    expect(after.slice(0, width - 1)).toEqual(before.slice(1))
+    expect(after[width - 1]).toBe(columnsOf(timelineLanes([ring[k]!], 1, 2), ['u', 'v'])[0])
   }
 })
 
-test('timelineLanes: downsampling keeps the peak pressure, over-budget and queue marks', () => {
-  const slots = [slot(300, { p: 20 }), slot(299, { p: 90, b: 3, q: [1, 2] }), slot(298, { p: 10 })]
-  const t = timelineLanes(slots, 2, NOW, 2)
-  expect(t.pressure).toBe(' ' + '█')
-  expect(t.pressureScores).toEqual([undefined, 90])
-  expect(t.overBudget).toEqual([false, true])
-  expect(t.queue).toEqual([0, 2])
+test('timelineLanes: something that lasted n ticks stays n columns wide as it scrolls', () => {
+  const ring = jittered(60)
+  const builds = (k: number) => timelineLanes(ring.slice(0, k), 30, 2).lanes.find(l => l.udid === 'u')!.cells.join('')
+  // Builds run in ticks 2-4, 11-13, 20-22, ...: every run of █ in view is three wide.
+  for (let k = 30; k <= 60; k++) {
+    const runs = builds(k).match(/█+/g) ?? []
+    expect(runs.slice(1, -1).every(r => r.length === 3)).toBe(true)
+    expect(runs.length).toBeGreaterThan(1)
+  }
 })
 
-test('timelineLanes: slots older than ten minutes are ignored', () => {
-  expect(timelineLanes([slot(700, { sims: { u: ['█'] } })], 5, NOW, 2).lanes).toEqual([])
+test('timelineLanes: a missed tick leaves an empty column', () => {
+  const t = timelineLanes([slot(9, { p: 50 }), slot(3, { p: 50 }), slot(0, { p: 50 })], 5, 2)
+  expect(t.pressure).toBe(' ▅ ▅▅')
+})
+
+test('timelineLanes: after a gap wider than the timeline only the newer ticks show', () => {
+  const slots = [slot(700, { p: 90, sims: { old: ['█'] } }), slot(3, { p: 10 }), slot(0, { p: 10 })]
+  const t = timelineLanes(slots, 10, 2)
+  expect(t.pressure).toBe(' '.repeat(8) + '▁▁')
+  expect(t.lanes).toEqual([])
 })
 
 test('pressureLabel: the thresholds the header and the timeline share', () => {

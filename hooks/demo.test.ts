@@ -20,7 +20,7 @@ test('calm has no alerts', () => {
 test('overBudget warns about the budget and marks the timeline', () => {
   const input = scenarios.overBudget()
   expect(texts('overBudget').some(t => /3 simulators booted/.test(t))).toBe(true)
-  expect(timelineLanes(input.snap.timeline ?? [], 20, input.now, 2).overBudget.some(Boolean)).toBe(true)
+  expect(timelineLanes(input.snap.timeline ?? [], 20, 2).overBudget.some(Boolean)).toBe(true)
 })
 
 test('clash is critical and names both agents', () => {

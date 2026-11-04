@@ -51,10 +51,15 @@ Every section has a short grey line saying what it is for.
 - **Queue.** Builds waiting for a slot, with position, who asked, why they wait
   and for how long. The title says PAUSED when the queue is paused.
 - **Alerts.** Things that need a look, worst first. Hidden when there are none.
-- **Timeline.** The last ten minutes: one lane per simulator showing boot,
-  build, test, drive and idle, plus the budget line, the queue and a pressure
-  sparkline. Each kind has its own colour (build orange, test blue, drive
-  purple, boot grey, idle dim) and its own shape, and the legend shows both.
+- **Timeline.** One column per 3-second tick, the newest on the right: one lane
+  per simulator showing boot, build, test, drive and idle, plus the budget line,
+  the queue and a pressure sparkline. Each new tick moves everything one column
+  to the left, and nothing moves between ticks. A tick that was missed (the Mac
+  slept, the sampler was busy) leaves an empty column. The heading says how much
+  time fits: about 2 minutes at 80 columns, at most the 10 minutes kept. Only
+  simulators seen in that time get a lane. Each kind has its own colour (build
+  orange, test blue, drive purple, boot grey, idle dim) and its own shape, and
+  the legend shows both.
 - **Host.** Free disk, DerivedData and simulator data sizes in MB, GB or TB ("-" when
   not measured), the Xcode in use, and whether the simulator service (CoreSim) is
   ok or hung.
