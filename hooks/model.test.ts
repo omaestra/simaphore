@@ -610,3 +610,50 @@ test('shared Xcode window: two sessions or helpers on one tab in the last 5 minu
   const other = agent('s2', 'feature-b', { activities: [xcode('main', 'w2')] })
   expect(alertsFor({}, [], [a, other])).toEqual([])
 })
+
+// --- Android emulators in the panel (P8) ---
+
+const EMU: Snapshot['sims'][number] = {
+  udid: '@Pixel_9', name: 'Pixel_9', runtime: 'Android', state: 'Booted', memMb: 0, cpu: 0, isAppRunning: false,
+  android: { serial: 'emulator-5554' },
+}
+
+test('an emulator counts as a device in the header, the pressure bar and the budget alert', () => {
+  const withEmu = snapWith({ sims: [SIM_A, SIM_B, EMU] })
+
+  expect(headerOf(withEmu, S)).toMatchObject({ hasEmulator: true, booted: 3, isOverBudget: true })
+  expect(headerOf(snapWith({ sims: [SIM_A, SIM_B, SIM_C] }), S).hasEmulator).toBe(false)
+  expect(headerOf(snapWith({ sims: [SIM_A, { ...EMU, state: 'Booting' }] }), S)).toMatchObject({ hasEmulator: true, booted: 2 })
+  expect(pressure(snapWith({ sims: [SIM_A, EMU] }), S).parts.sims).toBe(100)
+  expect(alertsFor({ sims: [SIM_A, SIM_B, EMU] }).map(a => a.text)).toEqual(['3 devices booted, the budget is 2'])
+  expect(alertsFor({ sims: [SIM_A, SIM_B, SIM_C] }).map(a => a.text)).toEqual(['3 simulators booted, the budget is 2'])
+})
+
+test('without Xcode there is no CoreSim alert and no hung rows, even when simctl last failed', () => {
+  const f = fixture()
+  const noXcode = { hasXcode: false, simctlOk: false, sims: [EMU] }
+
+  expect(alertsFor(noXcode)).toEqual([])
+  expect(alertsFor({ simctlOk: false })[0]).toMatchObject({ severity: 'critical' })
+  const model = buildModel({ ...f, snap: { ...f.snap, ...noXcode }, settings: DEFAULT_SETTINGS })
+  expect(model.hasXcode).toBe(false)
+  expect(model.sims.map(r => r.tone)).toEqual(['unused'])
+  expect(buildModel({ ...f, settings: DEFAULT_SETTINGS }).hasXcode).toBe(true)
+})
+
+test('an activity on @Pixel_9 shows its agent as the user of the emulator row, and a lowercase UDID still matches', () => {
+  const f = fixture()
+  const activity = (sim: string) => ({ agent: 'main', kind: 'verify' as const, detail: 'shell', verb: 'shell', at: NOW - 1000, toolUseId: 't', sim })
+  const snap = { ...f.snap, sims: [SIM_A, EMU], trees: [], runs: [] }
+  const userOf = (sim: string, udid: string) => {
+    const agents = [agent('s9', 'feature-z', { activities: [activity(sim)] })]
+    const model = buildModel({ ...f, snap, agents, queue: [], settings: DEFAULT_SETTINGS })
+
+    return model.cards.find(c => c.sim.udid === udid)?.user?.name
+  }
+
+  expect(userOf('@Pixel_9', '@Pixel_9')).toBe('feature-z')
+  expect(userOf('@pixel_9', '@Pixel_9')).toBeUndefined()
+  expect(userOf(SIM_A.udid.toLowerCase(), SIM_A.udid)).toBe('feature-z')
+  expect(userOf(SIM_A.name, SIM_A.udid)).toBe('feature-z')
+})

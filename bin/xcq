@@ -8,6 +8,8 @@ src=$0
 while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
 BIN=$(cd "$(dirname "$src")" && pwd -P)
 . "$BIN/lib.sh"
+kind_in=$XCQ_KIND sim_in=$XCQ_SIM   # read once; the build's children must not inherit them
+unset XCQ_KIND XCQ_SIM
 if [ $# -lt 3 ]; then echo "usage: xcq <ticket-id> <label> <command-string> | -- <prog> [args...]" >&2; exit 64; fi
 ticket=$1 label=$2
 argv=0 dest= ws= prj=
@@ -43,6 +45,8 @@ if [ -n "$dest" ]; then
     case $dest in *platform=*) case $dest in *Simulator*) simid=$idpart ;; esac ;; *) simid=$idpart ;; esac
   fi
 fi
+# An emulator key from xcgradle gates the ticket the same way.
+if [ -n "$sim_in" ] && is_avd_key "$sim_in"; then simid=$sim_in sim=$sim_in; fi
 export XCQ_HELD=1 XCQ_HELD_BY=$$   # nested xcodebuild calls (shim) pass straight through
 DIR=${SIMAPHORE_DIR:-$HOME/.claude/simaphore}
 Q=$DIR/queue
@@ -69,6 +73,7 @@ json_str() { printf %s "$1" | tr -d '\n' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 # The action word of the command, as the panel names it (same order as its list of kinds).
 kind_of() {
   local w
+  case " $XB_ACTIONS " in *" ${kind_in:-?} "*) echo "$kind_in"; return ;; esac   # xcgradle says its kind
   set -f; xb_scan $cmd; set +f   # no globbing of the words
   for w in $XB_ACTIONS; do
     case " $XB_FOUND " in *" $w "*) echo "$w"; return ;; esac
@@ -141,20 +146,21 @@ read_memory() {
 # 0: we hold the simulator and there is room. 1: wait (sets reason and msg). Fatal codes exit.
 # xcsim exit 64 means "not a simulator": skip the gate.
 sim_check() {
-  local out rc
+  local out rc noun=simulator many=simulators
+  case $simid in @*) noun=emulator many=devices ;; esac
   sim_active || { simid=; return 0; }   # simaphore is off: no gate
   out=$("$XCSIM" claim "$simid"); rc=$?
   case $rc in
     0) ;;
-    1) reason=sim; msg="simulator held by $out"; return 1 ;;
-    4) echo "xcq: simulator is reserved"; exit 4 ;;
+    1) reason=sim; msg="$noun held by $out"; return 1 ;;
+    4) echo "xcq: $noun is reserved"; exit 4 ;;
     64) simid=; return 0 ;;
     74) echo "xcq: cannot write the lease folder in $DIR/leases"; exit 74 ;;
     76) echo "xcq: cannot read the simulator list"; exit 76 ;;
     *) echo "xcq: simulator check failed (xcsim exit $rc)"; exit $rc ;;
   esac
   out=$("$XCSIM" room "$simid") && return 0
-  reason=room; msg="$out simulators on, waiting for room"; return 1
+  reason=room; msg="$out $many on, waiting for room"; return 1
 }
 
 simlast=
@@ -224,7 +230,7 @@ write_ticket waiting
 
 # A test on a simulator id needs that simulator's lease and room (xcsim) before it takes a build slot.
 if [ -n "$simid" ]; then
-  case $(kind_of) in test|test-without-building) ;; *) simid= ;; esac
+  case $simid in @*) ;; *) case $(kind_of) in test|test-without-building) ;; *) simid= ;; esac ;; esac
 fi
 reason= msg=
 while :; do

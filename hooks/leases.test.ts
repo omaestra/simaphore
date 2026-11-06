@@ -4,10 +4,19 @@ import type { Activity, AgentRecord } from '../types'
 
 import {
   LEASE_IDLE_MS,
+  androidCallsOf,
+  androidRoute,
+  emulatorsOf,
+  fleetDeny,
   simsInUse,
   agentUsedAt,
   busySimulators,
+  busyDeny,
   canFreeLeases,
+  deviceNoun,
+  emulatorDevice,
+  heldNote,
+  roomNote,
   debuggedByOwner,
   claimOutcome,
   endedAndIdle,
@@ -449,4 +458,227 @@ test('simsInUse picks the booted simulators each agent was just using', () => {
   expect(simsInUse([act({ sim: 'Bench 2', kind: 'test', verb: 'test', at: now - 60 * 60_000 })], devices, now)).toEqual([{ agent: 'main', udid: 'BBBB' }])
   // two agents on one simulator: the latest wins
   expect(simsInUse([act({ sim: 'Bench 1', agent: 'a' }), act({ sim: 'Bench 1', agent: 'b', at: now - 10 })], devices, now)).toEqual([{ agent: 'b', udid: 'AAAA' }])
+})
+
+// ---------- emulators (P6) ----------
+
+const emu = (avd: string, serial?: string, isReady = true) => emulatorDevice({ avd, pid: 1, serial, isReady })
+
+test('an emulator is a device keyed @AVD that carries its serial; booting until adb says it is up', () => {
+  expect(emu('Pixel_9', 'emulator-5554')).toEqual({
+    udid: '@Pixel_9', name: 'Pixel_9', platform: 'Android', version: '', state: 'Booted', isAvailable: true, serial: 'emulator-5554',
+  })
+  expect(emu('Tablet', undefined, false)).toEqual({
+    udid: '@Tablet', name: 'Tablet', platform: 'Android', version: '', state: 'Booting', isAvailable: true,
+  })
+})
+
+test('lease files keyed @AVD are read as they are, never upper-cased (D5)', () => {
+  const text = 'session=s1\nagent=a7\nlabel=task\noriginalName=Pixel_9\nclaimedAt=5\nlastUsed=9\n'
+  expect(parseLease('@Pixel_9', text)).toEqual(lease('@Pixel_9', 's1', 'a7', { originalName: 'Pixel_9', claimedAt: 5, lastUsed: 9 }))
+  expect(parseLease('@pixel_9', text)?.udid).toBe('@pixel_9')
+  expect(parseLease('@Small.Phone-2', text)?.udid).toBe('@Small.Phone-2')
+  for (const bad of ['@', '@a/b', '@a b', '@../x', "@a'b", '@a\nb', 'Pixel_9']) expect(parseLease(bad, text)).toBeUndefined()
+  expect(parseLease('@Pixel_9', 'junk')).toBeUndefined()
+})
+
+test('an emulator lease is freed for the same reasons, and for a deleted AVD (R13)', () => {
+  const now = 10_000_000
+  const ctx = {
+    now,
+    liveSessions: new Set(['s1']),
+    endedHolders: new Set<string>(),
+    busyUdids: new Set<string>(),
+    deviceUdids: new Set<string>(),
+    avdKeys: new Set(['@Pixel_9']),
+  }
+  const l = lease('@Pixel_9', 's1', '', { lastUsed: now })
+  // no simulator list (no Xcode): never "simulator deleted"
+  expect(freeReason(l, ctx)).toBeUndefined()
+  expect(freeReason(l, { ...ctx, avdKeys: new Set() })).toBe('AVD deleted')
+  // the AVD folder could not be read: nothing is freed for it
+  expect(freeReason(l, { ...ctx, avdKeys: undefined })).toBeUndefined()
+  expect(freeReason(l, { ...ctx, liveSessions: new Set() })).toBe('session ended')
+  expect(freeReason(l, { ...ctx, endedHolders: new Set(['s1/main']) })).toBe('helper finished')
+  const old = { ...l, lastUsed: now - LEASE_IDLE_MS - 1 }
+  expect(freeReason(old, ctx)).toBe('unused 10 min')
+  expect(freeReason(old, { ...ctx, busyUdids: new Set(['@Pixel_9']) })).toBeUndefined()
+  // a simulator lease never looks at the AVD list
+  expect(freeReason(lease(A, 's1', '', { lastUsed: now }), { ...ctx, deviceUdids: new Set([A]) })).toBeUndefined()
+  expect(freeReason(lease(A, 's1', '', { lastUsed: now }), ctx)).toBe('simulator deleted')
+})
+
+test('booted means the holder\'s simulator, even when they hold an emulator too (R14)', () => {
+  const list = [dev(A, 'iPhone 17 Pro', '26.3', 'Booted'), emu('Pixel_9', 'emulator-5554')]
+  const both = [lease('@Pixel_9', 's1'), lease(A, 's1')]
+  expect(resolveTarget({ booted: true }, list, both, 's1/main')).toEqual({ udid: A })
+  expect(resolveTarget({ booted: true }, list, [lease('@Pixel_9', 's1')], 's1/main')).toEqual({ none: true })
+  expect(rewriteNames('xcrun simctl launch booted com.x', list, both, 's1/main')).toBe(`xcrun simctl launch '${A}' com.x`)
+  // an @ key resolves as it is
+  expect(resolveTarget({ id: '@Pixel_9' }, list, [], 'h')).toEqual({ udid: '@Pixel_9' })
+  expect(resolveTarget({ id: '@pixel_9' }, list, [], 'h')).toEqual({ none: true })
+  // a simulator name never picks an emulator
+  expect(resolveTarget({ name: 'Pixel_9' }, list, [], 'h')).toEqual({ none: true })
+})
+
+test('suggestFree works per platform and counts both kinds toward room', () => {
+  const list = [
+    dev(A, 'iPhone 17', '26.3'),
+    dev(B, 'iPhone 16', '26.3', 'Booted'),
+    emu('Pixel_9', 'emulator-5554'),
+    emu('Tablet', 'emulator-5556'),
+    emu('Early', undefined, false),
+  ]
+  // iOS (the default) never offers an emulator
+  expect(suggestFree(list, [lease(B)], new Set(), [])?.udid).toBe(A)
+  expect(suggestFree(list, [lease(A), lease(B)], new Set(), [])).toBeUndefined()
+  // Android offers only running emulators that are free and not the owner's, booted first
+  expect(suggestFree(list, [], new Set(), [], undefined, Infinity, 'Android')?.udid).toBe('@Pixel_9')
+  expect(suggestFree(list, [lease('@Pixel_9')], new Set(), ['Tablet'], undefined, Infinity, 'Android')?.udid).toBe('@Early')
+  expect(suggestFree(list, [lease('@Pixel_9')], new Set(), ['Tablet', 'Early'], undefined, Infinity, 'Android')).toBeUndefined()
+  // the AVD name is the one preferred
+  expect(suggestFree(list, [], new Set(), [], 'Tablet', Infinity, 'Android')?.udid).toBe('@Tablet')
+  // four devices on, limit 4: an off simulator is not offered (one shared limit, R17)
+  expect(suggestFree(list, [lease(B)], new Set(), [], undefined, 4)).toBeUndefined()
+  expect(suggestFree(list, [lease(B)], new Set(), [], undefined, 5)?.udid).toBe(A)
+  expect(mustWaitForRoom(A, list, 4)).toBe(true)
+  expect(mustWaitForRoom('@Pixel_9', list, 4)).toBe(false)
+  expect(mustWaitForRoom('@Off', list, 5)).toBe(false)
+})
+
+test('the notes keep today\'s simulator text and say emulator for an @ key', () => {
+  const tail = 'you will be notified when it finishes, so do not start it again.'
+  expect(deviceNoun(A)).toBe('simulator')
+  expect(deviceNoun('@Pixel_9')).toBe('emulator')
+  expect(heldNote('s1/main')).toBe(`simaphore: that simulator is held by s1/main. This command waits in the background and runs when it is free; ${tail}`)
+  expect(heldNote('s1/main', 'emulator')).toBe(`simaphore: that emulator is held by s1/main. This command waits in the background and runs when it is free; ${tail}`)
+  expect(roomNote(2)).toBe(`simaphore: 2 simulators are already on. This command waits in the background and runs when there is room; ${tail}`)
+  expect(roomNote(2, 'devices')).toBe(`simaphore: 2 devices are already on. This command waits in the background and runs when there is room; ${tail}`)
+  expect(busyDeny('s1/main')).toBe('simulator busy, held by s1/main, try again shortly')
+  expect(busyDeny('s1/main', 'emulator')).toBe('emulator busy, held by s1/main, try again shortly')
+  expect(reservedDeny()).toBe(
+    "that simulator is the owner's; agents do not use it. No other simulator is free right now: the rest are held, the owner's, or off with no room to boot one.",
+  )
+  expect(reservedDeny(dev(B, 'iPhone 16', '26.2'))).toBe(`that simulator is the owner's; agents do not use it. Use "iPhone 16" instead (id=${B}).`)
+  expect(reservedDeny(emu('Tablet', 'emulator-5556'), 'emulator')).toBe(
+    'that emulator is the owner\'s; agents do not use it. Use "Tablet" instead (adb -s emulator-5556).',
+  )
+  expect(reservedDeny(undefined, 'emulator')).toBe(
+    "that emulator is the owner's; agents do not use it. No other emulator is free right now: the rest are held or the owner's.",
+  )
+})
+
+test('agents\' use of an emulator keeps its lease busy and marks when it was used', () => {
+  const list = [dev(A, 'iPhone 17 Pro', '26.2', 'Booted'), emu('Pixel_9', 'emulator-5554')]
+  const act = (sim: string, at: number, extra = {}) => ({ agent: 'main', kind: 'drive' as const, sim, detail: '', at, toolUseId: 't', ...extra })
+  const agents = [agent('s1', { activities: [act('@Pixel_9', 500, { endedAt: 900 }), act('@Gone', 600)] })]
+  expect(agentUsedAt(agents, list, [lease('@Pixel_9', 's1', '', { lastUsed: 700 })])).toEqual(new Map([['@Pixel_9', 900]]))
+  expect(busySimulators([agent('s1', { activities: [act('@Pixel_9', 950)] })], [], list, [], 1000).has('@Pixel_9')).toBe(true)
+  expect(busySimulators([], [{ sim: '@Pixel_9' }], list, [], 1000).has('@Pixel_9')).toBe(true)
+  expect(busySimulators([], [{ sim: '@Gone' }], list, [], 1000).size).toBe(0)
+})
+
+// ---------- room across both kinds (P7) ----------
+
+test('the room shutdown picks one victim across simulators and emulators, longest unused first (R18)', () => {
+  const now = 100 * 60_000
+  const list = [dev(A, 'a', '1', 'Booted'), emu('Pixel_9', 'emulator-5554'), emu('Tablet', 'emulator-5556')]
+  const used = new Map([[A, now - LEASE_IDLE_MS - 5], ['@Pixel_9', now - LEASE_IDLE_MS - 50]])
+  const args = { devices: list, leases: [] as Lease[], reserved: new Set<string>(), reservedNames: [] as string[], agentUsedAt: used, now }
+  expect(shutdownCandidate(args)?.udid).toBe('@Pixel_9')
+  // held, the owner's by name, or in use: the simulator goes instead
+  expect(shutdownCandidate({ ...args, leases: [lease('@Pixel_9')] })?.udid).toBe(A)
+  expect(shutdownCandidate({ ...args, reservedNames: ['Pixel_9'] })?.udid).toBe(A)
+  expect(shutdownCandidate({ ...args, inUse: new Set(['@Pixel_9']) })?.udid).toBe(A)
+  // the simulator was left longer: it goes first
+  expect(shutdownCandidate({ ...args, agentUsedAt: new Map([[A, now - LEASE_IDLE_MS - 90], ['@Pixel_9', now - LEASE_IDLE_MS - 50]]) })?.udid).toBe(A)
+})
+
+test('the room shutdown never picks an emulator no agent used, used lately, or still booting (R18)', () => {
+  const now = 100 * 60_000
+  const args = { leases: [] as Lease[], reserved: new Set<string>(), reservedNames: [] as string[], now }
+  expect(shutdownCandidate({ ...args, devices: [emu('Tablet', 'emulator-5556')], agentUsedAt: new Map() })).toBeUndefined()
+  expect(shutdownCandidate({ ...args, devices: [emu('Tablet', 'emulator-5556')], agentUsedAt: new Map([['@Tablet', now - 1000]]) })).toBeUndefined()
+  const old = new Map([['@Tablet', now - LEASE_IDLE_MS - 5]])
+  expect(shutdownCandidate({ ...args, devices: [emu('Tablet', undefined, false)], agentUsedAt: old })).toBeUndefined()
+  expect(shutdownCandidate({ ...args, devices: [emu('Tablet', 'emulator-5556')], agentUsedAt: old })?.udid).toBe('@Tablet')
+})
+
+// ---------- android routing (P13) ----------
+
+const route = (call: Parameters<typeof androidRoute>[0], over: Partial<Parameters<typeof androidRoute>[1]> = {}) =>
+  androidRoute(call, {
+    devices: [emu('Pixel_9', 'emulator-5554'), emu('Tablet', 'emulator-5556')],
+    leases: [],
+    holder: 's1/main',
+    reserved: new Set<string>(),
+    reservedNames: [],
+    maxSims: 4,
+    ...over,
+  })
+const theirs = (udid: string) => lease(udid, 's2', '', { label: 'other-app' })
+
+test('androidRoute passes host calls and fleet calls when no other agent holds an emulator', () => {
+  expect(route({ verb: 'devices', kind: 'host' }, { leases: [theirs('@Pixel_9')] })).toEqual({ pass: true })
+  expect(route({ verb: 'reconnect', kind: 'fleet' })).toEqual({ pass: true })
+  expect(route({ verb: 'reconnect', kind: 'fleet' }, { leases: [lease('@Pixel_9')] })).toEqual({ pass: true })
+  expect(route({ verb: 'reconnect', kind: 'fleet' }, { leases: [theirs(A)] })).toEqual({ pass: true })
+  const denied = route({ verb: 'reconnect', kind: 'fleet' }, { leases: [theirs('@Pixel_9')] })
+  expect(denied).toEqual({ deny: fleetDeny('reconnect', 'other-app') })
+  expect(fleetDeny('kill-server', 'x')).toMatch(/^simaphore: /)
+})
+
+test('androidRoute passes a device call with no single target, an unknown serial or a stopped AVD', () => {
+  expect(route({ verb: 'shell', kind: 'device' })).toEqual({ pass: true })
+  expect(route({ verb: 'shell', kind: 'device', serial: 'emulator-9999' })).toEqual({ pass: true })
+  expect(route({ verb: 'shell', kind: 'device', serial: 'R58M12345' })).toEqual({ pass: true })
+  expect(route({ verb: 'kill', kind: 'device', avd: 'Off_AVD' })).toEqual({ pass: true })
+  // a booting emulator has no serial yet; a call with no target must not match it (R7)
+  expect(route({ verb: 'shell', kind: 'device' }, { devices: [emu('Pixel_9', undefined, false)] })).toEqual({ pass: true })
+})
+
+test('androidRoute refuses the owner\'s emulator and names a free one by its adb serial (R15)', () => {
+  const out = route({ verb: 'shell', kind: 'device', serial: 'emulator-5554' }, { reservedNames: ['Pixel_9'] })
+  expect(out).toEqual({ deny: reservedDeny(emu('Tablet', 'emulator-5556'), 'emulator') })
+  expect('deny' in out && out.deny).toContain('adb -s emulator-5556')
+  const none = route({ verb: 'shell', kind: 'device', serial: 'emulator-5554' }, { reservedNames: ['Pixel_9'], leases: [theirs('@Tablet')] })
+  expect(none).toEqual({ deny: reservedDeny(undefined, 'emulator') })
+})
+
+test('androidRoute waits for an emulator another agent holds, and claims one that is free or its own', () => {
+  const call = { verb: 'install', kind: 'device' as const, serial: 'emulator-5554' }
+  expect(route(call, { leases: [theirs('@Pixel_9')] })).toEqual({ wait: '@Pixel_9', note: heldNote('other-app', 'emulator') })
+  expect(route(call, { leases: [lease('@Pixel_9')] })).toEqual({ claim: '@Pixel_9' })
+  expect(route(call)).toEqual({ claim: '@Pixel_9' })
+})
+
+test('androidRoute boots with room, waits without it, refuses a reserved AVD, waits on a held running one', () => {
+  expect(route({ verb: 'boot', kind: 'boot', avd: 'New' })).toEqual({ claim: '@New' })
+  const full = [dev(A, 'iPhone 17', '27.0', 'Booted'), dev(B, 'iPhone 17 Pro', '26.3', 'Booted'), emu('Pixel_9', 'emulator-5554')]
+  expect(route({ verb: 'boot', kind: 'boot', avd: 'New' }, { devices: full, maxSims: 3 })).toEqual({ wait: '@New', note: roomNote(3, 'devices') })
+  expect(route({ verb: 'boot', kind: 'boot', avd: 'Pixel_9' }, { devices: full, maxSims: 3 })).toEqual({ claim: '@Pixel_9' })
+  expect(route({ verb: 'boot', kind: 'boot', avd: 'New' }, { reservedNames: ['New'] })).toHaveProperty('deny')
+  expect(route({ verb: 'boot', kind: 'boot', avd: 'Pixel_9' }, { leases: [theirs('@Pixel_9')] })).toEqual({
+    wait: '@Pixel_9',
+    note: heldNote('other-app', 'emulator'),
+  })
+})
+
+test('androidCallsOf returns adb and emulator calls and ignores heredoc text', () => {
+  const ctx = { emulators: ['emulator-5554'] }
+  const calls = androidCallsOf('adb -s emulator-5554 install a.apk && emulator -avd Pixel_9', ctx)
+  expect(calls.map(c => c.verb)).toEqual(['install', expect.any(String)])
+  expect(calls).toHaveLength(2)
+  expect(androidCallsOf("cat <<'EOF'\nadb -s emulator-5554 reconnect\nEOF", ctx)).toEqual([])
+})
+
+test('emulatorsOf keeps only Android rows and carries the serial', () => {
+  const row = { memMb: 0, cpu: 0, isAppRunning: false }
+  const out = emulatorsOf([
+    { ...row, udid: A, name: 'iPhone 17', runtime: 'iOS 27.0', state: 'Booted' },
+    { ...row, udid: '@Pixel_9', name: 'Pixel_9', runtime: 'Android', state: 'Booted', android: { serial: 'emulator-5554' } },
+    { ...row, udid: '@Tab', name: 'Tab', runtime: 'Android', state: 'Booting', android: {} },
+  ])
+  expect(out.map(d => [d.udid, d.state, d.serial])).toEqual([['@Pixel_9', 'Booted', 'emulator-5554'], ['@Tab', 'Booting', undefined]])
+  expect(out[1]).not.toHaveProperty('serial')
 })

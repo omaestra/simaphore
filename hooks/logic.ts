@@ -30,6 +30,8 @@ import {
   simProcsOf,
   appFromText,
 } from './builds'
+import { androidQueued, atCommand, avdKey, emulatorCalls, isAvdKey, isProgram, adbCalls, needsDevice, shellWords } from './android'
+import type { GradleTarget } from './android'
 import { sizeText } from './text'
 
 // ---------- colours ----------
@@ -176,6 +178,54 @@ export function mergeHost(older: HostInfo | undefined, newer: HostInfo | undefin
 /** A slow fact is due when both our own last try and the carried reading are old enough. */
 export const isHostDue = (now: number, attemptedAt: number, readAt: number | undefined, everyMs: number) =>
   now - attemptedAt >= everyMs && now - (readAt ?? 0) >= everyMs
+
+// ---------- what a round runs ----------
+
+/** The Developer folder D11 checks: `DEVELOPER_DIR` wins over `xcode-select -p`; an `.app` means its Contents/Developer. */
+export function developerFolder(developerDir: string | undefined, selectPath: string | undefined): string | undefined {
+  const raw = (developerDir ?? '').trim() || (selectPath ?? '').trim()
+  if (raw === '') return undefined
+  const dir = raw.replace(/\/+$/, '')
+
+  return dir.endsWith('.app') ? `${dir}/Contents/Developer` : dir
+}
+
+/** Xcode counts as found when this file exists (D11). A file check, never `xcrun`. */
+export const simctlIn = (developer: string) => `${developer}/usr/bin/simctl`
+
+export type HostJob = 'df' | 'dd' | 'dev' | 'xcode'
+
+export type RoundInput = {
+  hasSdk: boolean
+  hasXcode: boolean
+  /** Emulators the process list shows this round. */
+  emulatorCount: number
+  /** The adb the SDK check found. */
+  adb?: string
+}
+
+export type RoundPlan = {
+  /** `xcrun simctl list` and what hangs off it: app lists, boot watch, log streams, simulator lease upkeep. */
+  isSimctl: boolean
+  /** plutil reads of build folders and Xcode versions. */
+  isPlutil: boolean
+  /** Slow jobs that may start this round when due. `xcode` is the D11 check, plus the version with Xcode. */
+  hostJobs: HostJob[]
+  /** `adb devices`, only while the process list shows an emulator (D18). */
+  adbDevices?: string[]
+}
+
+/** Which Xcode and Android commands one sampler round may run (R2, R28). */
+export function roundPlan(i: RoundInput): RoundPlan {
+  const isAdb = i.hasSdk && i.adb !== undefined && i.emulatorCount > 0
+
+  return {
+    isSimctl: i.hasXcode,
+    isPlutil: i.hasXcode,
+    hostJobs: i.hasXcode ? ['df', 'dd', 'dev', 'xcode'] : ['df', 'xcode'],
+    ...(isAdb && { adbDevices: [i.adb!, 'devices'] }),
+  }
+}
 
 export function parseTherm(text: string): ThermalState {
   const rank = (s: ThermalState) => THERMAL_ORDER.indexOf(s)
@@ -738,7 +788,17 @@ export type SampleInput = {
   appStates?: Record<string, Record<string, AppLife>>
   /** UDIDs whose `simctl bootstatus` finished: booted whatever their age. */
   readySims?: Set<string>
+  /** Running Android emulators; absent with no SDK. */
+  emulators?: EmulatorSeen[]
+  /** False when no Xcode was found (D11). */
+  hasXcode?: boolean
 }
+
+/** A running emulator as one round found it: ps gives its AVD and pid, adb its serial and whether it finished booting. */
+export type EmulatorSeen = { avd: string; pid: number; serial?: string; isReady: boolean }
+
+/** The runtime column of an emulator row. */
+export const ANDROID_RUNTIME = 'Android'
 
 export function buildSnapshot(input: SampleInput): Snapshot {
   const { now, procs, topMem, sysctl, sims, prev } = input
@@ -752,10 +812,13 @@ export function buildSnapshot(input: SampleInput): Snapshot {
   const appSims = new Set<string>()
   const bootAge = new Map<string, number>()
   const appCpu = new Map<string, number>()
+  const emulators = input.emulators ?? []
+  const emulatorOf = new Map(emulators.map(e => [e.pid, avdKey(e.avd)]))
 
   for (const p of procs) {
     const udid = simOfProc(p.pid, byPid, simMemo)
-    const id = udid ? simGroupId(udid) : groupOf(p.command)
+    const emulator = emulatorOf.get(p.pid)
+    const id = emulator ? simGroupId(emulator) : udid ? simGroupId(udid) : groupOf(p.command)
     groupById.set(p.pid, id)
     if (udid && LAUNCHD_SIM.test(p.command) && p.ageS !== undefined) bootAge.set(udid, p.ageS)
     if (udid && isSimApp(p.command)) {
@@ -795,7 +858,9 @@ export function buildSnapshot(input: SampleInput): Snapshot {
   }
 
   const simStats = new Map<string, SimStat>()
-  const simIds = sims ? [...sims.keys()] : [...groups.keys()].filter(id => id.startsWith('sim:')).map(id => id.slice(4))
+  const simIds = sims
+    ? [...sims.keys()]
+    : [...groups.keys()].filter(id => id.startsWith('sim:') && !isAvdKey(id.slice(4))).map(id => id.slice(4))
   for (const udid of simIds) {
     const info = sims?.get(udid)
     const group = groups.get(simGroupId(udid))
@@ -814,6 +879,20 @@ export function buildSnapshot(input: SampleInput): Snapshot {
     const appFrom = appSims.has(udid) ? appFromText({ udid, name: info?.name ?? '' }, identity) : undefined
     if (appFrom) stat.appFrom = appFrom
     simStats.set(udid, stat)
+  }
+  for (const e of emulators) {
+    const key = avdKey(e.avd)
+    const group = groups.get(simGroupId(key))
+    simStats.set(key, {
+      udid: key,
+      name: e.avd,
+      runtime: ANDROID_RUNTIME,
+      state: e.isReady ? 'Booted' : 'Booting',
+      memMb: group?.memMb ?? 0,
+      cpu: group?.cpu ?? 0,
+      isAppRunning: false,
+      android: e.serial ? { serial: e.serial } : {},
+    })
   }
 
   for (const group of groups.values()) {
@@ -875,6 +954,7 @@ export function buildSnapshot(input: SampleInput): Snapshot {
     hasTop: topMem.size > 0,
     groups: sorted,
     sims: sim,
+    ...(input.hasXcode === false && { hasXcode: false }),
     builds: [...builds.values()]
       .map(b => ({ ...b, memMb: Math.round(b.memMb), cpu: round1(b.cpu) }))
       .sort((a, b) => b.memMb - a.memMb),
@@ -1284,7 +1364,8 @@ export function isBuildingCall(command: string): boolean {
 /**
  * True when the stand-ins belong on PATH: a building xcodebuild, or any script (a `*.sh` or
  * `path/x` file, `bash|python|ruby|node|perl <file>`, `make`, `fastlane`) that may call xcodebuild
- * or simctl itself. Text in quotes or heredocs never counts.
+ * or simctl itself. Text in quotes or heredocs never counts. A bare `gradle` is not a script here;
+ * `queueGradle` handles Gradle.
  */
 export function usesShim(command: string): boolean {
   return isBuildingCall(command) || RUNS_SCRIPT.test(stripQuoted(command))
@@ -1304,6 +1385,10 @@ export type ShimContext = {
   renameSims: boolean
   /** Owner's simulator names, comma separated. */
   reservedSims: string
+  /** The emulator a Gradle install is aimed at; `queueGradle` hands it to `xcgradle`. */
+  gradleTarget?: GradleTarget
+  /** The emulators that are on, with their serials; `queueGradle` gives an `android run` its `XCQ_SIM`. */
+  emulatorsOn?: { key: string; serial: string }[]
 }
 
 /** Puts the xcodebuild shim first on PATH (unless `withPath` is false) and tells it who is asking. */
@@ -1318,22 +1403,160 @@ export function shimPrefix(c: ShimContext, { withPath = true } = {}): string {
   )
 }
 
+/** The task words of a Gradle call; none when it only asks for help or status, so it does not build. */
+function gradleTasks(args: string[]): string[] {
+  if (args.some(w => GRADLE_PASS.test(w))) return []
+
+  return args.filter(w => !w.startsWith('-') && w !== 'tasks' && w !== 'help')
+}
+
+type RawWord = { start: number; raw: string }
+
+/** The command's words with their offsets in the original text, cut into segments like `segmentsOf`. */
+function rawSegments(command: string): RawWord[][] {
+  const out: RawWord[][] = [[]]
+  const heredocs: { word: string; isDash: boolean }[] = []
+  let start = -1
+  const endWord = (i: number) => {
+    if (start >= 0) out[out.length - 1]!.push({ start, raw: command.slice(start, i) })
+    start = -1
+  }
+  const split = (i: number) => {
+    endWord(i)
+    out.push([])
+  }
+  let i = 0
+  while (i < command.length) {
+    const ch = command[i]!
+    const two = command.slice(i, i + 2)
+    if (ch === '\\') {
+      if (command[i + 1] === '\n') endWord(i)
+      else if (start < 0) start = i
+      i += 2
+    } else if (ch === "'" || ch === '"') {
+      if (start < 0) start = i
+      i++
+      while (i < command.length && command[i] !== ch) i += ch === '"' && command[i] === '\\' ? 2 : 1
+      i++
+    } else if (ch === '#' && start < 0) {
+      while (i < command.length && command[i] !== '\n') i++
+    } else if (ch === '\n') {
+      split(i)
+      i++
+      for (const h of heredocs.splice(0)) {
+        while (i < command.length) {
+          let end = command.indexOf('\n', i)
+          if (end < 0) end = command.length
+          const line = h.isDash ? command.slice(i, end).replace(/^\t+/, '') : command.slice(i, end)
+          i = end + 1
+          if (line === h.word) break
+        }
+      }
+    } else if (two === '<<' && command[i + 2] !== '<') {
+      endWord(i)
+      // Same delimiter rule as `stripHeredocs`, so `$((1<<2))` is not a heredoc.
+      const m = /^(-?)\s*(["']?)([A-Za-z_][\w-]*)\2/.exec(command.slice(i + 2))
+      if (m) {
+        heredocs.push({ word: m[3]!, isDash: m[1] === '-' })
+        i += 2 + m[0].length
+      } else i += 2
+    } else if (two === '&&' || two === '||') {
+      split(i)
+      i += 2
+    } else if (ch === ';' || ch === '|' || ch === '(' || ch === ')' || (ch === '&' && !/[<>]/.test(command[i - 1] ?? ''))) {
+      split(i)
+      i++
+    } else if (/\s/.test(ch)) {
+      endWord(i)
+      i++
+    } else {
+      if (start < 0) start = i
+      i++
+    }
+  }
+  endWord(command.length)
+
+  return out
+}
+
+type GradleCall = { start: number; tasks: string[]; serial?: string }
+/** A call `queueGradle` queues: Gradle, or `android build`/`run` (`verb`, and for `run` the serial it targets). */
+type QueueSite = { start: number; gradle?: GradleCall; verb?: 'build' | 'run'; serial?: string }
+
+/** The calls that build, at command position, with the offset of each: Gradle with its own `ANDROID_SERIAL=`, and `android build`/`run`. */
+function queueSites(command: string, emulators: string[]): QueueSite[] {
+  const out: QueueSite[] = []
+  for (const segment of rawSegments(command)) {
+    let words = segment
+    if (words[0] && /^(?:then|do)$/.test(words[0].raw)) words = words.slice(1)
+    const { vars, rest } = atCommand(words.map(w => shellWords(w.raw)[0] ?? ''))
+    const head = rest[0]
+    if (head === undefined) continue
+    const start = words[words.length - rest.length]!.start
+    if (isProgram(head, 'android')) {
+      const queued = androidQueued(rest.slice(1), emulators)
+      if (queued) out.push({ start, verb: queued.verb, ...('serial' in queued && queued.serial && { serial: queued.serial }) })
+    } else if (isProgram(head, 'gradle') || /gradlew$/.test(head)) {
+      const tasks = gradleTasks(rest.slice(1))
+      if (tasks.length) out.push({ start, gradle: { start, tasks, ...(vars.ANDROID_SERIAL && { serial: vars.ANDROID_SERIAL }) } })
+    }
+  }
+
+  return out
+}
+
+/** The Gradle calls `queueGradle` queues: their task words and their own `ANDROID_SERIAL=`, if any. */
+export function gradleCalls(command: string): { tasks: string[]; serial?: string }[] {
+  return queueSites(command, []).flatMap(s => (s.gradle ? [{ tasks: s.gradle.tasks, ...(s.gradle.serial && { serial: s.gradle.serial }) }] : []))
+}
+
+/**
+ * Puts `<root>/bin/xcgradle` before every Gradle call that builds (`gradlew`, `gradle`) and every
+ * `android build` or `android run` that builds, at command position only. Everything else stays as
+ * typed; quoted text (`sh -c '...'`) is left alone.
+ * With a `target`, a Gradle call that installs onto a device also gets `ANDROID_SERIAL` and `XCQ_SIM` as
+ * arguments, which `xcgradle` exports. An `android run` gets `XCQ_SIM` for the emulator it targets.
+ */
+export function queueGradle(
+  command: string,
+  root: string,
+  target?: GradleTarget,
+  emulators: { key: string; serial: string }[] = [],
+): string | undefined {
+  const sites = queueSites(command, emulators.map(e => e.serial))
+  if (!sites.length) return undefined
+  const insert = `${shellQuote(`${root}/bin/xcgradle`)} `
+  const withTarget = target ? `ANDROID_SERIAL=${shellQuote(target.serial)} XCQ_SIM=${shellQuote(target.key)} ` : ''
+  const extra = (s: QueueSite): string => {
+    if (s.gradle) return s.gradle.tasks.some(needsDevice) ? withTarget : ''
+    const key = s.verb === 'run' ? emulators.find(e => e.serial === s.serial)?.key : undefined
+
+    return key === undefined ? '' : `XCQ_SIM=${shellQuote(key)} `
+  }
+
+  return sites.reduceRight((text, s) => text.slice(0, s.start) + insert + extra(s) + text.slice(s.start), command)
+}
+
 /**
  * Holds a command back until the simulator is free and there is room. Permission checks can't
- * read `"$PATH"` or a `{ }` group, so the shim goes on PATH only when xcodebuild runs, and braces
- * only wrap a compound command.
+ * read `"$PATH"` or a `{ }` group, so the shim goes on PATH only when xcodebuild runs or Gradle is
+ * queued, and braces only wrap a compound command. Gradle builds in the body are queued too.
  */
 export function waitForSim(c: ShimContext, xcsim: string, udid: string, command: string): string {
-  const prefix = shimPrefix(c, { withPath: usesShim(command) })
-  const body = /[;&|\n]/.test(command) ? `{\n${command}\n}` : command
+  const queued = queueGradle(command, c.root, c.gradleTarget, c.emulatorsOn)
+  const prefix = shimPrefix(c, { withPath: usesShim(command) || queued !== undefined })
+  const text = queued ?? command
+  const body = /[;&|\n]/.test(text) ? `{\n${text}\n}` : text
 
   return `${prefix}${shellQuote(xcsim)} wait ${shellQuote(udid)} && ${body}`
 }
 
 export type BashRewrite = { command: string; isQueued: boolean }
 
-/** `isQueued` means the call is a real build: it must run in the background. */
+/** `isQueued` means the call is a real build: it must run in the background. Gradle is checked first. */
 export function rewriteBash(command: string, c: ShimContext): BashRewrite | undefined {
+  const gradle = queueGradle(command, c.root, c.gradleTarget, c.emulatorsOn)
+  if (gradle !== undefined) return { command: shimPrefix(c) + gradle, isQueued: true }
   if (!usesShim(command)) return undefined
 
   return { command: shimPrefix(c) + command, isQueued: isBuildingCall(command) }
@@ -1386,6 +1609,140 @@ export const simRef = (value: string | undefined): string | undefined => {
 
 const baseName = (path: string) => path.split('/').filter(Boolean).pop() ?? path
 
+/** The command split at `&&`, `||`, `;`, `|` and newlines outside quotes; heredoc bodies dropped. */
+export function segmentsOf(command: string): string[] {
+  const raw = stripHeredocs(command)
+  const out: string[] = []
+  let current = ''
+  let quote = ''
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!
+    if (ch === '\\' && quote !== "'") {
+      current += ch + (raw[i + 1] ?? '')
+      i++
+    } else if (quote) {
+      if (ch === quote) quote = ''
+      current += ch
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+    } else if (/^(?:&&|\|\||[;|\n])/.test(raw.slice(i, i + 2))) {
+      out.push(current)
+      current = ''
+      if (raw.slice(i, i + 2) === '&&' || raw.slice(i, i + 2) === '||') i++
+    } else {
+      current += ch
+    }
+  }
+  out.push(current)
+
+  return out
+}
+
+
+const GRADLE_PASS = /^(?:-v|--version|-h|-\?|--help|--stop|--status)$/
+const APK_RE = /\.apks?$/i
+
+/** The Gradle task that says what this run is (the same pass-through rule as `outside_builds`). */
+function gradleActivity(args: string[]): ActivityDraft | null {
+  for (const task of gradleTasks(args)) {
+    const name = task.replace(/.*:/, '')
+    if (/^install/.test(name)) return { kind: 'install', detail: `installing ${task}`, verb: 'install' }
+    if (/AndroidTest$/.test(name) || /^test/.test(name) || name === 'check') return { kind: 'test', detail: `testing ${task}` }
+    if (/^(?:assemble|bundle)/.test(name) || name === 'build') return { kind: 'build', detail: `building ${task}` }
+  }
+
+  return null
+}
+
+/** What `adb <verb> …` does, from the words after `adb`. */
+function adbActivity(segment: string, rest: string[]): ActivityDraft | null {
+  const call = adbCalls([segment], { emulators: [] })[0]
+  if (!call || call.kind !== 'device') return null
+  const args = rest.slice(rest.indexOf(call.verb, 1) + 1)
+  const apk = args.find(w => APK_RE.test(w))
+  switch (call.verb) {
+    case 'install':
+    case 'install-multiple':
+    case 'uninstall':
+      return { kind: 'install', detail: apk ? `install ${baseName(apk)}` : call.verb, verb: 'install' }
+    case 'emu':
+      return args[0] === 'kill' ? { kind: 'boot', detail: 'shutdown', verb: 'shutdown' } : null
+    case 'logcat':
+      return { kind: 'verify', detail: 'logcat', verb: 'logcat' }
+    case 'push':
+    case 'pull':
+      return { kind: 'verify', detail: args[0] ? `${call.verb} ${baseName(args[0])}` : call.verb, verb: call.verb }
+    case 'exec-out':
+    case 'shell':
+      break
+    default:
+      return null
+  }
+  const [word, sub] = args
+  if (word === 'screencap') return { kind: 'verify', detail: 'screenshot', verb: 'screenshot' }
+  if (call.verb === 'shell' && word === 'am' && sub === 'start') return { kind: 'launch', detail: 'launch', verb: 'launch' }
+  if (call.verb === 'shell' && word === 'am' && (sub === 'force-stop' || sub === 'kill')) {
+    return { kind: 'launch', detail: 'terminate', verb: 'terminate' }
+  }
+  if (call.verb === 'shell' && word === 'input') return { kind: 'verify', detail: sub ? `input ${sub}` : 'input', verb: 'input' }
+
+  return { kind: 'verify', detail: 'shell', verb: 'shell' }
+}
+
+/** `android build`: not in the parsers because it names no device. */
+function isAndroidBuild(args: string[]): boolean {
+  let i = 0
+  for (; args[i]?.startsWith('-'); i++) {
+    if (['-h', '--help', '-V', '--version'].includes(args[i]!)) return false
+    if (args[i] === '--sdk') i++
+  }
+  const own = args.slice(i + 1)
+  const mine = own.includes('--') ? own.slice(0, own.indexOf('--')) : own
+
+  return args[i]?.toLowerCase() === 'build' && !mine.includes('-h') && !mine.includes('--help')
+}
+
+/** What an `emulator` or `android` run does. */
+function emulatorActivity(segment: string, rest: string[]): ActivityDraft | null {
+  if (isProgram(rest[0], 'android') && isAndroidBuild(rest.slice(1))) return { kind: 'build', detail: 'building', verb: 'build' }
+  const call = emulatorCalls([segment], [])[0]
+  if (!call) return null
+  const sim = call.avd !== undefined ? { sim: `@${call.avd}` } : {}
+  if (call.kind === 'boot') return { kind: 'boot', detail: 'boot', verb: 'boot', ...sim }
+  switch (call.verb) {
+    case 'emulator stop':
+      return { kind: 'boot', detail: 'shutdown', verb: 'shutdown', ...sim }
+    case 'install': {
+      const apk = rest.find(w => APK_RE.test(w))
+      return { kind: 'install', detail: apk ? `install ${baseName(apk)}` : 'install', verb: 'install' }
+    }
+    case 'run':
+      return { kind: 'run', detail: 'run', verb: 'run' }
+    default:
+      return { kind: 'verify', detail: call.verb, verb: call.verb }
+  }
+}
+
+/** The first adb, emulator, android or Gradle run in the command that does something. */
+function androidActivity(command: string): ActivityDraft | null {
+  for (const segment of segmentsOf(command)) {
+    const { rest } = atCommand(shellWords(segment))
+    const head = rest[0]
+    if (head === undefined) continue
+    const draft = isProgram(head, 'adb')
+      ? adbActivity(segment, rest)
+      : isProgram(head, 'emulator') || isProgram(head, 'android')
+        ? emulatorActivity(segment, rest)
+        : isProgram(head, 'gradle') || /gradlew$/.test(head)
+          ? gradleActivity(rest.slice(1))
+          : null
+    if (draft) return draft
+  }
+
+  return null
+}
+
 function bashActivity(command: string): ActivityDraft | null {
   const raw = stripHeredocs(command)
   const bare = stripQuoted(command)
@@ -1421,7 +1778,7 @@ function bashActivity(command: string): ActivityDraft | null {
     }
   }
 
-  return null
+  return androidActivity(command)
 }
 
 const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined)
@@ -1564,8 +1921,9 @@ const lastAt = (a: Activity) => Math.max(a.at, a.endedAt ?? 0)
 export const isUsing = (a: Activity, now: number) =>
   USING_KINDS.has(a.kind) && !NOT_USING_VERBS.has(a.verb ?? '') && now - lastAt(a) < USING_MS
 
-const matchesSim = (ref: string | undefined, sim: Pick<SimStat, 'udid' | 'name'>) =>
-  ref !== undefined && (ref.toUpperCase() === sim.udid || ref === sim.name)
+/** An `@` emulator key matches exactly; a UDID in any case, or a name, as before. */
+export const matchesSim = (ref: string | undefined, sim: Pick<SimStat, 'udid' | 'name'>) =>
+  ref !== undefined && ((isAvdKey(ref) ? ref : ref.toUpperCase()) === sim.udid || ref === sim.name)
 
 const who = (rec: Pick<AgentRecord, 'label'>, agent: string) => (agent === 'main' || agent === '' ? rec.label : `${rec.label} / ${agent.slice(0, 6)}`)
 
@@ -1638,7 +1996,7 @@ export function sharedSims(
     for (const a of rec.activities) {
       if (!a.sim || !isUsing(a, now)) continue
       const sim = sims.find(s => matchesSim(a.sim, s))
-      const key = sim?.udid ?? a.sim.toUpperCase()
+      const key = sim?.udid ?? (isAvdKey(a.sim) ? a.sim : a.sim.toUpperCase())
       if (waiting.has(waitKey(rec.session, a.agent, key))) continue
       const entry = by.get(key) ?? {
         name: sim?.name ?? (UUID.test(a.sim) ? a.sim.slice(0, 8) : a.sim),
