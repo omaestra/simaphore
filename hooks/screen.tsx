@@ -6,7 +6,7 @@ import type { Elements } from 'claude-code'
 import type { Confirm } from '../types'
 import { confirmText } from './confirm'
 import { idleMinutesOf } from './logic'
-import { buildModel, pressureLabel, timelineLanes } from './model'
+import { buildModel, pressureLabel, rightmost, timelineLanes } from './model'
 import type { Model, ModelInput, PressureLabel } from './model'
 import { PHONE_HEIGHT, PHONE_WIDTH, phoneRows } from './phone'
 import { CARD_MASCOT_WIDTH, MASCOT_WIDTH, mascotRows } from './mascot'
@@ -613,13 +613,15 @@ function timelineView(c: Ctx): { lines: Seg[][]; columns: number } {
   const timeline = snap.timeline ?? []
   const labelOf = (udid: string) => laneLabel(sims.find(x => x.udid === udid), udid)
   const tracks = [`budget ${settings.maxSims}`, 'queue', 'pressure']
-  // One tick per column, never more columns than ticks kept; the right edge stays put on screen.
+  // One tick per column, never more columns than ticks kept.
   const laneWidthFor = (labelW: number) => Math.min(SLOT_COUNT, Math.max(LANE_MIN_W, c.width - labelW - LANE_OWNER_W))
-  // Size the labels to the simulators on screen at the narrowest lane, then draw at the width left.
-  const names = timelineLanes(timeline, laneWidthFor(LANE_LABEL_MAX_W), settings.maxSims).lanes.map(l => labelOf(l.udid))
-  const labelW = laneLabelWidth([...names, ...tracks], c.width)
+  // Size the labels to every simulator that can be on screen, at the widest lane.
+  const widest = timelineLanes(timeline, laneWidthFor(LANE_LABEL_MIN_W), settings.maxSims)
+  const fitted = laneLabelWidth([...widest.lanes.map(l => labelOf(l.udid)), ...tracks], c.width)
+  // Once the lane is at its cap the label column takes the spare room, so the right edge stays put on screen.
+  const labelW = Math.max(fitted, Math.min(LANE_LABEL_MAX_W, c.width - LANE_OWNER_W - SLOT_COUNT))
   const laneW = laneWidthFor(labelW)
-  const t = timelineLanes(timeline, laneW, settings.maxSims)
+  const t = rightmost(widest, laneW)
   const lanes = t.lanes.map((lane): Seg[] => {
     const sim = sims.find(x => x.udid === lane.udid)
     const owner = sim?.owner

@@ -92,7 +92,7 @@ import type { Theme } from './mascot'
 import { drawScreen } from './screen'
 import { titleOf, workRows } from './rows'
 import { recordSlot } from './timeline'
-import { sideRead } from './sideread'
+import { sideRead, wakeOnNews } from './sideread'
 import {
   appStatesOfLines,
   isWake,
@@ -724,7 +724,7 @@ export const register: Register = (on, options) => {
     }
 
     // Frees leases whose holder is gone, restores names, makes room.
-    const keepLeases = async (now: number, simOut: string, queue: Ticket[], agents: AgentRecord[], procs: Proc[]) => {
+    const keepLeases = async (now: number, listAt: number, simOut: string, queue: Ticket[], agents: AgentRecord[], procs: Proc[]) => {
       const devices = parseDevices(simOut)
       if (devices.length === 0) return
       const leases = await readLeases($, dir)
@@ -736,6 +736,7 @@ export const register: Register = (on, options) => {
       const busyUdids = busySimulators(agents, queue, devices, leases, now)
       const ctx = {
         now,
+        listAt,
         liveSessions: liveSessions(agents, new Set(procs.map(p => p.pid))),
         endedHolders: endedAndIdle(endedHolders(agents), leases, busyUdids),
         busyUdids,
@@ -775,14 +776,11 @@ export const register: Register = (on, options) => {
     }
 
     // `top` (about 0.8 s), the simulator list and heat run on their own, so a tick never waits for
-    // them and the timeline keeps its beat. An answer starts an early update that uses it at once.
-    // A failed simulator read wakes it too, to count the failure; the other two just try again.
-    const wakeIfAnswered = (answer: { text: string }) => {
-      if (answer.text !== '') wake()
-    }
-    const topRead = sideRead(() => run(['top', '-l', '1', '-stats', 'pid,mem'], 20_000), wakeIfAnswered)
-    const simsRead = sideRead(() => run(['xcrun', 'simctl', 'list', '-j']), () => wake())
-    const thermRead = sideRead(() => run(['pmset', '-g', 'therm'], THERM_TIMEOUT_MS), wakeIfAnswered)
+    // them and the timeline keeps its beat. An answer with something new starts an early update.
+    // A failed simulator read does not: the next beat takes it and counts the failure.
+    const topRead = sideRead(() => run(['top', '-l', '1', '-stats', 'pid,mem'], 20_000), wakeOnNews(wake))
+    const simsRead = sideRead(() => run(['xcrun', 'simctl', 'list', '-j']), wakeOnNews(wake))
+    const thermRead = sideRead(() => run(['pmset', '-g', 'therm'], THERM_TIMEOUT_MS), wakeOnNews(wake))
     // Answers that come back while this session isn't sampling would be old by the next sample.
     const dropSideReads = () => {
       topRead.take()
@@ -833,7 +831,7 @@ export const register: Register = (on, options) => {
         if (isGood) sims = parseSimctl(simOut)
         if (isGood) allSims = parseSimctl(simOut, true)
         if (isGood && sims) watchBoot(sims)
-        if (isGood) await keepLeases(now, simOut, queue, agents, procs).catch(() => undefined)
+        if (isGood) await keepLeases(now, simAnswer.at, simOut, queue, agents, procs).catch(() => undefined)
       }
       const bootedUdids = sims ? [...sims].filter(([, info]) => info.state === 'Booted').map(([udid]) => udid) : []
       syncAppStreams(bootedUdids.filter(udid => readySims.has(udid)))

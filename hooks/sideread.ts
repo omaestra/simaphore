@@ -21,7 +21,14 @@ export function sideRead(read: () => Promise<string>, onAnswer: (answer: Answer)
     start(at) {
       if (isRunning) return false
       isRunning = true
-      void read()
+      // A read that throws at once counts like one that rejects.
+      let running: Promise<string>
+      try {
+        running = read()
+      } catch (e) {
+        running = Promise.reject(e)
+      }
+      void running
         .then(text => {
           isRunning = false
           answer = { at, text }
@@ -39,5 +46,16 @@ export function sideRead(read: () => Promise<string>, onAnswer: (answer: Answer)
 
       return found
     },
+  }
+}
+
+/** An `onAnswer` that calls `wake` only for news: text that is not empty and differs from the last answer's. */
+export function wakeOnNews(wake: () => void): (answer: Answer) => void {
+  let lastText: string | undefined
+
+  return answer => {
+    const isNews = answer.text !== '' && answer.text !== lastText
+    lastText = answer.text
+    if (isNews) wake()
   }
 }

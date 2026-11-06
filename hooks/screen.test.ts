@@ -222,6 +222,33 @@ test('a new tick moves every drawn lane one column left and keeps its right edge
   })
 })
 
+/** The calm scene plus a simulator with a long name, seen in the ticks `from` to `to` of the 200 kept. */
+const withLongSim = (columns: number, from: number, to: number): ScreenInput => {
+  const s = screenOf('calm', columns)
+  const { snap } = s.input
+  const long = sim('DDDDDDDD-0000-4000-8000-000000000004', 'iPhone 17 Pro Max')
+  const timeline = (snap.timeline ?? []).map((t, i) => (i >= from && i <= to ? { ...t, sims: { ...t.sims, [long.udid]: ['█'] as [string] } } : t))
+
+  return { ...s, input: { ...s.input, snap: { ...snap, sims: [...snap.sims, long], letters: { ...snap.letters, [long.udid]: 'D' }, timeline } } }
+}
+
+/** Where the lane ends on screen: the width of the budget row. */
+const laneEnd = (input: ScreenInput) => cellWidth((timelineOf(input).find(l => l.includes('budget')) ?? '').trimEnd())
+
+test('on a wide pane the newest column stays put whatever the label widths', () => {
+  const plain = screenOf('calm', 260)
+
+  expect(laneEnd(withLongSim(260, 190, 199))).toBe(laneEnd(plain))
+  expect(laneEnd(plain)).toBe(224)
+  expect(laneEnd(withLongSim(230, 190, 199))).toBe(laneEnd(screenOf('calm', 230)))
+})
+
+test('a simulator only in the older part of the view gets its whole label', () => {
+  const lines = timelineOf(withLongSim(120, 108, 112))
+
+  expect(lines.some(l => l.startsWith(' D iPhone 17 Pro Max '))).toBe(true)
+})
+
 test('timeline is hidden when toggled off or when the pane is short', () => {
   const s = screenOf('busy', 80)
 

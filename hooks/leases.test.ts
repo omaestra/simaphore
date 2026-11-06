@@ -165,6 +165,7 @@ test('freeReason branches in order', () => {
   const now = 10_000_000
   const ctx = {
     now,
+    listAt: now,
     liveSessions: new Set(['s1']),
     endedHolders: new Set<string>(),
     busyUdids: new Set<string>(),
@@ -449,4 +450,11 @@ test('simsInUse picks the booted simulators each agent was just using', () => {
   expect(simsInUse([act({ sim: 'Bench 2', kind: 'test', verb: 'test', at: now - 60 * 60_000 })], devices, now)).toEqual([{ agent: 'main', udid: 'BBBB' }])
   // two agents on one simulator: the latest wins
   expect(simsInUse([act({ sim: 'Bench 1', agent: 'a' }), act({ sim: 'Bench 1', agent: 'b', at: now - 10 })], devices, now)).toEqual([{ agent: 'b', udid: 'AAAA' }])
+})
+
+test('freeReason keeps a lease claimed after the device list was read', () => {
+  const ctx = { now: 5000, listAt: 2000, liveSessions: new Set(['s1']), endedHolders: new Set<string>(), busyUdids: new Set<string>(), deviceUdids: new Set<string>() }
+  expect(freeReason(lease(A, 's1', '', { claimedAt: 2500, lastUsed: 5000 }), ctx)).toBeUndefined()
+  expect(freeReason(lease(A, 's1', '', { claimedAt: 1500, lastUsed: 5000 }), ctx)).toBe('simulator deleted')
+  expect(freeReason(lease(A, 's1', '', { claimedAt: 0, lastUsed: 5000 }), ctx)).toBe('simulator deleted')
 })

@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { sideRead } from './sideread'
+import { sideRead, wakeOnNews } from './sideread'
 
 // A read the test finishes by hand.
 function pending() {
@@ -72,4 +72,31 @@ test('sideRead gives no answer for a read that throws, and can start again', asy
   expect(side.take()).toBeUndefined()
   expect(woken).toBe(0)
   expect(side.start(2)).toBe(true)
+})
+
+test('sideRead treats a read that throws at once like a rejected one', async () => {
+  let woken = 0
+  let isThrowing = true
+  const side = sideRead(() => {
+    if (isThrowing) throw new Error('no such program')
+
+    return Promise.resolve('ok')
+  }, () => woken++)
+  expect(side.start(1)).toBe(true)
+  await settle()
+  expect(side.take()).toBeUndefined()
+  expect(woken).toBe(0)
+  isThrowing = false
+  expect(side.start(2)).toBe(true)
+})
+
+test('wakeOnNews wakes only for text that is new and not empty', () => {
+  let woken = 0
+  const onAnswer = wakeOnNews(() => woken++)
+  onAnswer({ at: 1, text: 'a' })
+  onAnswer({ at: 2, text: 'a' })
+  onAnswer({ at: 3, text: '' })
+  expect(woken).toBe(1)
+  onAnswer({ at: 4, text: 'b' })
+  expect(woken).toBe(2)
 })

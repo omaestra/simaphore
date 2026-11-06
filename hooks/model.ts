@@ -726,6 +726,19 @@ export function timelineLanes(timeline: TimelineSlot[], width: number, maxSims: 
   }
 }
 
+/** The view `columns` wide that ends at the same tick: the rightmost columns, minus lanes left with no mark. */
+export function rightmost(t: TimelineLanes, columns: number): TimelineLanes {
+  const keep = <T>(a: T[]) => a.slice(-columns)
+
+  return {
+    lanes: t.lanes.map(l => ({ udid: l.udid, cells: keep(l.cells), colors: keep(l.colors) })).filter(l => l.cells.some(ch => ch !== ' ')),
+    overBudget: keep(t.overBudget),
+    queue: keep(t.queue),
+    pressure: t.pressure.slice(-columns),
+    pressureScores: keep(t.pressureScores),
+  }
+}
+
 export type Model = {
   settings: Settings
   header: Header

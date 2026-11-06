@@ -304,6 +304,8 @@ export function resolveTarget(spec: TargetSpec, devices: Device[], leases: Lease
 
 export type FreeContext = {
   now: number
+  /** When the device list was read; a lease claimed after that can't be in it. */
+  listAt: number
   liveSessions: Set<string>
   endedHolders: Set<string>
   busyUdids: Set<string>
@@ -312,7 +314,7 @@ export type FreeContext = {
 
 /** Why a lease should be freed, or undefined to keep it. */
 export function freeReason(lease: Lease, ctx: FreeContext): string | undefined {
-  if (!ctx.deviceUdids.has(lease.udid)) return 'simulator deleted'
+  if (!ctx.deviceUdids.has(lease.udid) && lease.claimedAt < ctx.listAt) return 'simulator deleted'
   if (!ctx.liveSessions.has(lease.session)) return 'session ended'
   if (ctx.endedHolders.has(keyOf(lease))) return 'helper finished'
   if (!ctx.busyUdids.has(lease.udid) && ctx.now - lease.lastUsed > LEASE_IDLE_MS) return 'unused 10 min'

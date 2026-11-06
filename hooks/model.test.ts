@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import type { AppLife, BuildTree, RunResult, Snapshot, TimelineSlot } from '../types'
 import { NOW, agent, ticket, SIM_A, SIM_B, SIM_C, fixture, snapshot, tree } from './rows.fixture'
 import { IN_USE_CPU } from './logic'
-import { DEFAULT_SETTINGS, pressureLabel, alertsOf, timelineLanes, buildModel, queuePauseAction, queueRows, cpuPercent, headerOf, pressure, settingsOf } from './model'
+import { DEFAULT_SETTINGS, pressureLabel, alertsOf, timelineLanes, rightmost, buildModel, queuePauseAction, queueRows, cpuPercent, headerOf, pressure, settingsOf } from './model'
 
 test('settings fall back to the defaults', () => {
   expect(settingsOf({})).toEqual({ maxSims: 2, renameSims: true, reservedSims: '', lowDiskGb: 20, asciiSymbols: false })
@@ -412,6 +412,19 @@ const columnsOf = (t: ReturnType<typeof timelineLanes>, udids: string[]) =>
     }),
     p, t.pressureScores[i], t.overBudget[i], t.queue[i],
   ].join('|'))
+
+test('rightmost: the right-hand part of a wide view is the narrower view', () => {
+  const ring = jittered(120)
+  const gap = [...ring.slice(0, 50), ...ring.slice(53)]
+  const early = ring.map((t, i) => (i < 20 ? { ...t, sims: { ...t.sims, old: ['█'] as [string] } } : t))
+  for (const t of [ring, gap, early, ring.slice(0, 7), []]) {
+    for (const wide of [60, 150]) {
+      for (const w of [1, 5, 40, 60, 100]) {
+        if (w <= wide) expect(rightmost(timelineLanes(t, wide, 2), w)).toEqual(timelineLanes(t, w, 2))
+      }
+    }
+  }
+})
 
 test('timelineLanes: every new tick moves every mark exactly one column left', () => {
   const ring = jittered(120)

@@ -104,3 +104,8 @@ how much time fits in the panel's width.
 - Review fixes (R1, R7): `hooks/timeline.ts` skips a slot only under 1.5 s after the last one
   (was 2.5 s), so a beat that ran late no longer drops the next one. `top` is read once per 10 s
   again, and answers that come back while a session isn't sampling are thrown away.
+- Low review fixes (D5, R1, R5): an answer starts an early update only when it is new (not empty and
+  not the same as the last one), so a failed or unchanged read no longer wakes the sampler. A lease
+  counts as "simulator deleted" only if it was claimed before the device list was read. The label
+  column is sized on the widest view, so the newest column stays put on screen; on a wide pane the
+  labels take the spare room once the lane hits 200 columns. The lanes are worked out once per draw.

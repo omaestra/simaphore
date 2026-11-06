@@ -40,7 +40,8 @@ t kill-server                                          # when done
 - To see lanes in the timeline without booting simulators, copy a real
   `~/.claude/simaphore/latest.json` into `$SD` first and fill `timeline[k].sims` with
   made-up udids and marks (`█ ▓ ▒ ░ ·`). They show as `? E465E8F3`. They scroll off
-  after the time on screen (about 3 min at 80 columns), so seed again for a new run.
+  after the time on screen (the span in the TIMELINE heading, about 2 minutes at 80
+  columns), so seed again for a new run.
 
 ## Drive the panel
 
