@@ -191,10 +191,17 @@ session ending, or memory pressure. Waiters and the panel then react at once
 instead of on the next timer. The first session builds it once with `swiftc`
 into the simaphore folder, in the background.
 
-The slow reads (memory per app from `top`, the simulator list, heat) run on
-their own and never hold a tick back, so the timeline moves at an even beat.
-Each tick uses their last answer, and an answer that comes back refreshes the
-panel at once. Only the 3-second timer adds a timeline column.
+The helper also reads the Mac for the sampler: its processes, swap, load,
+memory pressure, heat and the whole-Mac CPU. Each line it sends (every 3 s) is
+the beat: it updates the panel and adds a timeline column. One `top`, kept open,
+adds memory and CPU for every account's processes. Both replace the old `ps`,
+`sysctl` and `pmset` calls and the `top` run every 10 s.
+
+The slower reads (the simulator list) run on their own and never hold a tick
+back, so the timeline moves at an even beat. Each tick uses their last answer,
+and an answer that comes back refreshes the panel at once. If the helper is
+missing or its line is more than 4.5 s late, the 3-second timer adds the
+column and the old reads (`ps`, `sysctl`, `pmset`) run instead.
 
 Polling stays as the safety net. Without the helper (no `swiftc`, or the build
 fails) everything polls as before, just a few seconds later. With it, the

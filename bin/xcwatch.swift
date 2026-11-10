@@ -109,6 +109,99 @@ func onExit(of pid: pid_t, _ handler: @escaping () -> Void) {
     sources.append(src)
 }
 
+// ---- sample: whole-Mac counters plus a row per process ----
+var timebase = mach_timebase_info()
+mach_timebase_info(&timebase)
+func nanos(_ ticks: UInt64) -> UInt64 {   // mach ticks to ns; 125/3 on Apple silicon
+    let m = ticks.multipliedFullWidth(by: UInt64(timebase.numer))
+    return UInt64(timebase.denom).dividingFullWidth(m).quotient
+}
+
+func sysctlValue<T>(_ name: String, _ v: inout T) {
+    var n = MemoryLayout<T>.size
+    withUnsafeMutablePointer(to: &v) { _ = sysctlbyname(name, $0, &n, nil, 0) }
+}
+
+func cString<T>(_ t: T) -> String { withUnsafeBytes(of: t) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) } }
+
+var argMax: Int32 = 0
+sysctlValue("kern.argmax", &argMax)
+let argBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(max(argMax, 4096)))
+
+// KERN_PROCARGS2: argc, exec path, NUL padding to 8 bytes, then argv (argv[0] may be empty).
+func commandLine(_ pid: pid_t) -> String? {
+    var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+    var size = Int(max(argMax, 4096))
+    guard sysctl(&mib, 3, argBuf, &size, nil, 0) == 0, size > 4 else { return nil }
+    let b = UnsafeBufferPointer(start: argBuf, count: size)
+    let argc = Int(b.withMemoryRebound(to: Int32.self) { $0[0] })
+    guard let pathEnd = b[4...].firstIndex(of: 0) else { return nil }
+    var i = (pathEnd - 4 + 1 + 7) / 8 * 8 + 4
+    guard i <= size, b[pathEnd..<i].allSatisfy({ $0 == 0 }) else { return nil }
+    var out: [String] = []
+    while out.count < argc && i < size {
+        let s = i
+        while i < size && b[i] != 0 { i += 1 }
+        out.append(String(decoding: b[s..<i], as: UTF8.self))
+        i += 1
+    }
+    return out.joined(separator: " ")
+}
+
+struct Known { let start: UInt64; let uuid: [UInt8]; let startSec: Int; let cmd: String }
+var known: [pid_t: Known] = [:]
+let myUid = getuid()
+
+func sampleLine() -> String {
+    let at = Int(Date().timeIntervalSince1970 * 1000)
+    var cpu = host_cpu_load_info()
+    var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.size / MemoryLayout<integer_t>.size)
+    _ = withUnsafeMutablePointer(to: &cpu) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count) }
+    }
+    var swap = xsw_usage(), la = loadavg(), cores: Int32 = 0, mem: UInt64 = 0, pressure: Int32 = 0
+    sysctlValue("vm.swapusage", &swap); sysctlValue("vm.loadavg", &la); sysctlValue("hw.ncpu", &cores)
+    sysctlValue("hw.memsize", &mem); sysctlValue("kern.memorystatus_vm_pressure_level", &pressure)
+    let fs = Double(max(la.fscale, 1))
+    let loads = [la.ldavg.0, la.ldavg.1, la.ldavg.2].map { String(format: "%.2f", Double($0) / fs) }
+
+    var pids = [pid_t](repeating: 0, count: Int(max(proc_listallpids(nil, 0), 0)) + 64)
+    let got = Int(max(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)), 0))
+    var mine: [String] = [], others: [String] = [], seen = Set<pid_t>()
+    for pid in pids.prefix(got) {
+        var sb = proc_bsdshortinfo()
+        guard proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &sb, Int32(MemoryLayout<proc_bsdshortinfo>.size)) > 0 else { continue }
+        let comm = "(\(cString(sb.pbsi_comm)))"
+        var ri = rusage_info_v4()
+        let ok = sb.pbsi_uid == myUid && withUnsafeMutablePointer(to: &ri) { p in
+            p.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V4, $0) }
+        } == 0
+        guard ok else {
+            var path = [CChar](repeating: 0, count: 4096)
+            let name = proc_pidpath(pid, &path, UInt32(path.count)) > 0 ? String(cString: path) : comm
+            others.append("[\(pid),\(sb.pbsi_ppid),\(sb.pbsi_uid),\(jsonString(name))]")
+            continue
+        }
+        let uuid = withUnsafeBytes(of: ri.ri_uuid) { Array($0) }
+        var k = known[pid]
+        if k == nil || k!.start != ri.ri_proc_start_abstime || k!.uuid != uuid {   // new process, or a reused pid
+            var bi = proc_bsdinfo()
+            let sec = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 ? Int(bi.pbi_start_tvsec) : 0
+            let line = commandLine(pid)
+            k = Known(start: ri.ri_proc_start_abstime, uuid: uuid, startSec: sec, cmd: line ?? comm)
+            if line != nil { known[pid] = k }   // a failed read is tried again next time
+        }
+        seen.insert(pid)
+        mine.append("[\(pid),\(sb.pbsi_ppid),\(nanos(ri.ri_user_time &+ ri.ri_system_time)),\(ri.ri_phys_footprint),\(k!.startSec),\(jsonString(k!.cmd))]")
+    }
+    known = known.filter { seen.contains($0.key) }
+    return "{\"kind\":\"sample\",\"at\":\(at),\"cores\":\(cores),"
+        + "\"ticks\":[\(cpu.cpu_ticks.0),\(cpu.cpu_ticks.1),\(cpu.cpu_ticks.2),\(cpu.cpu_ticks.3)],"
+        + "\"swap\":[\(swap.xsu_total),\(swap.xsu_used)],\"load\":[\(loads.joined(separator: ","))],"
+        + "\"mem\":\(mem),\"pressure\":\(pressure),\"thermal\":\(ProcessInfo.processInfo.thermalState.rawValue),"
+        + "\"mine\":[\(mine.joined(separator: ","))],\"others\":[\(others.joined(separator: ","))]}"
+}
+
 let devicesPath = resolve(ProcessInfo.processInfo.environment["XCWATCH_DEVICES"]
     ?? NSHomeDirectory() + "/Library/Developer/CoreSimulator/Devices")
 
@@ -226,6 +319,26 @@ case "tether":
     if getppid() != caller { stop() }   // the caller died before the watch was set up
     dispatchMain()
 
+// One line now, then one on each mark start + k*S. A repeating timer keeps its marks and skips missed ones.
+case "sample":
+    var every = 3.0
+    while !args.isEmpty {
+        let a = args.removeFirst()
+        switch a {
+        case "--every": guard let e = Double(value(a)), e > 0, e < 1e9 else { fail("xcwatch: bad --every") }; every = e
+        default: fail("xcwatch: unknown option \(a)")
+        }
+    }
+    let caller = getppid()
+    onExit(of: caller) { exit(0) }
+    if getppid() != caller { exit(0) }   // the caller died before the watch was set up
+    let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+    timer.schedule(deadline: .now(), repeating: every, leeway: .milliseconds(1))
+    timer.setEventHandler { emit(sampleLine()) }
+    timer.resume()
+    sources.append(timer)
+    dispatchMain()
+
 default:
-    fail("usage: xcwatch wait [--timeout S] [--memory] [--devices] <path>... | events [--devices] [--memory] [--pid N]... [--dir D]... | tether -- <command>...")
+    fail("usage: xcwatch wait [--timeout S] [--memory] [--devices] <path>... | events [--devices] [--memory] [--pid N]... [--dir D]... | tether -- <command>... | sample [--every S]")
 }

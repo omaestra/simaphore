@@ -79,16 +79,55 @@ export function parsePs(text: string): Proc[] {
 
 const UNIT_MB: Record<string, number> = { B: 1 / 1048576, K: 1 / 1024, M: 1, G: 1024, T: 1048576 }
 
-/** `top -l 1 -stats pid,mem` lines ("1234  45M+", "77  1.2G") to pid -> MB. */
-export function parseTop(text: string): Map<number, number> {
+export type TopReading = { mem: Map<number, number>; cpu: Map<number, number> }
+
+const TOP_ROW = /^\s*(\d+)\s+(?:([\d.]+)\s+)?([\d.]+)([BKMGT])[+-]?\s*$/
+
+/** `top` rows, "pid mem" ("77  1.2G") or "pid cpu mem" ("98522  0.0  409M "): pid -> MB, and pid -> %CPU when there. */
+export function parseTop(text: string): TopReading {
   const mem = new Map<number, number>()
+  const cpu = new Map<number, number>()
   for (const line of text.split('\n')) {
-    const m = /^\s*(\d+)\s+([\d.]+)([BKMGT])[+-]?\s*$/.exec(line)
-    if (m) {
-      mem.set(+m[1]!, +m[2]! * (UNIT_MB[m[3]!] ?? 1))
-    }
+    const m = TOP_ROW.exec(line)
+    if (!m) continue
+    mem.set(+m[1]!, +m[3]! * (UNIT_MB[m[4]!] ?? 1))
+    if (m[2] !== undefined) cpu.set(+m[1]!, +m[2])
   }
-  return mem
+  return { mem, cpu }
+}
+
+/** A reading being collected: `total` from its "Processes:" line, `rows` seen so far. */
+export type TopCarry = { total: number; rows: number; lines: string[] } | null
+
+/**
+ * Cuts the lines of a `top` stream into whole readings (their text). A reading ends when it has
+ * as many rows as its "Processes: N total" line says, or when the next "Processes:" line arrives.
+ */
+export function topReadings(carry: TopCarry, lines: string[]): { readings: string[]; carry: TopCarry } {
+  const readings: string[] = []
+  const finish = () => {
+    if (carry) readings.push(carry.lines.join('\n'))
+    carry = null
+  }
+  for (const line of lines) {
+    const header = /^Processes:\s+(\d+) total/.exec(line)
+    if (header) {
+      finish()
+      carry = { total: +header[1]!, rows: 0, lines: [line] }
+      continue
+    }
+    if (!carry) continue
+    carry.lines.push(line)
+    if (TOP_ROW.test(line)) carry.rows++
+    if (carry.rows >= carry.total) finish()
+  }
+  return { readings, carry }
+}
+
+/** The first reading's %CPU is not valid (it covers the time since boot): memory only. */
+export function readTop(text: string, isFirst: boolean): TopReading {
+  const reading = parseTop(text)
+  return isFirst ? { mem: reading.mem, cpu: new Map() } : reading
 }
 
 export type Sysctl = {
@@ -710,6 +749,8 @@ export type SampleInput = {
   claudeCwd: Map<number, string>
   prev: PrevSnapshot | null
   cores?: number
+  /** The whole Mac's CPU %, from the helper; without it the process sum is used. */
+  cpuPct?: number
   sampleMs?: number
   agents?: AgentRecord[]
   tickets?: Ticket[]
@@ -838,7 +879,9 @@ export function buildSnapshot(input: SampleInput): Snapshot {
   const cores = input.cores ?? 0
   const thermal = input.thermal ?? prev?.thermal
   const host = input.host ?? prev?.host
-  const cpuPct = cores > 0 ? Math.min(100, round1(procs.reduce((sum, p) => sum + p.cpu, 0) / cores)) : 0
+  const cpuPct = input.cpuPct !== undefined
+    ? Math.min(100, round1(input.cpuPct))
+    : cores > 0 ? Math.min(100, round1(procs.reduce((sum, p) => sum + p.cpu, 0) / cores)) : 0
 
   const reasons = overloadReasons({
     load1: sysctl.load[0],
