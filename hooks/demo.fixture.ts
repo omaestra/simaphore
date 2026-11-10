@@ -12,7 +12,7 @@ const driving = (sim: string): Activity => ({
   agent: 'main', kind: 'drive', sim, detail: 'tap', verb: 'tap', at: NOW - 2000, toolUseId: 'u1',
 })
 
-/** Ten minutes of history: a quiet start, then the given activity for the last `busyMin` minutes. */
+/** Ten minutes of history: a quiet start, then the given activity for the last `busyMin` minutes (short enough that both show on an 80-wide panel, about 2.5 minutes). */
 const history = (busyMin: number, cells: Record<string, [string, string?]>, score: number, booted: number): TimelineSlot[] =>
   Array.from({ length: 200 }, (_, i) => {
     const at = NOW - (199 - i) * 3000
@@ -33,7 +33,7 @@ export const calm = (): ModelInput =>
 export const overBudget = (): ModelInput =>
   input(snapshot({
     pressureLevel: 2,
-    timeline: history(4, {
+    timeline: history(1.5, {
       [SIM_A.udid]: ['▒', '#E8954A'], [SIM_B.udid]: ['·'], [SIM_C.udid]: ['·'],
     }, 70, 3),
   }), { agents: [agent('s1', 'feature-a'), agent('s2', 'feature-b')] })
@@ -60,7 +60,7 @@ export const hungCoreSim = (): ModelInput =>
   input(snapshot({ simctlOk: false, simctlFailedAt: NOW - 20_000, sims: [SIM_A] }), { agents: [agent('s1', 'feature-a')] })
 
 export const thermal = (): ModelInput =>
-  input(snapshot({ thermal: 'serious', cpuPct: 92, pressureLevel: 2, load: [14], timeline: history(5, { [SIM_A.udid]: ['█', '#E8954A'] }, 80, 1) }), {
+  input(snapshot({ thermal: 'serious', cpuPct: 92, pressureLevel: 2, load: [14], timeline: history(1.5, { [SIM_A.udid]: ['█', '#E8954A'] }, 80, 1) }), {
     agents: [agent('s1', 'feature-a')],
   })
 
@@ -78,7 +78,7 @@ export const busy = (): ModelInput =>
     ],
     runningApps: { [SIM_A.udid]: ['com.example.DemoApp.dev'], [SIM_B.udid]: ['com.example.DemoApp.dev', 'com.example.Playground'] },
     claudePids: [101, 102, 103, 104, 105, 999],
-    timeline: history(8, { [SIM_A.udid]: ['█', '#E8954A'], [SIM_B.udid]: ['▓', '#5B8DEF'] }, 55, 2),
+    timeline: history(2, { [SIM_A.udid]: ['█', '#E8954A'], [SIM_B.udid]: ['▓', '#5B8DEF'] }, 55, 2),
   }), {
     agents: [
       agent('s1', 'feature-a', { pid: 101, title: 'fix the login screen', subagents: { h1: 'check the login flow' }, activities: [{ ...driving(SIM_C.udid), agent: 'h1' }] }),
@@ -99,7 +99,7 @@ export const xcodeTest = (): ModelInput =>
       kind: 'test', sim: SIM_A.udid, xcodeVersion: '27.0', isOwnerBuild: true, folder: '/Users/dev/Projects/Demo', branch: 'main',
     })],
     runningApps: { [SIM_A.udid]: ['com.example.DemoApp.dev'] },
-    timeline: history(3, { [SIM_A.udid]: ['▓', '#5B8DEF'] }, 40, 1),
+    timeline: history(1, { [SIM_A.udid]: ['▓', '#5B8DEF'] }, 40, 1),
   }))
 
 /** An Android emulator beside an iOS simulator: feature-a holds the emulator and drives its app. */

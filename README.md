@@ -54,6 +54,11 @@ the app, waiting), for how long, which simulator or emulator it holds, and which
 folder and branch it works in. A new session that opens the panel sees all the others straight
 away.
 
+At the bottom, a timeline shows the last few minutes per simulator. It scrolls like
+a live chart: every 3 seconds everything moves one column to the left and the newest
+moment appears on the right. A wider pane shows more time (about 2 minutes at 80
+columns, up to 10 minutes).
+
 ![A calm panel: nothing is wrong](docs/images/calm.svg)
 
 ### 2. Builds wait their turn

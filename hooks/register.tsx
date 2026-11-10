@@ -118,6 +118,7 @@ import type { Theme } from './mascot'
 import { drawScreen } from './screen'
 import { titleOf, workRows } from './rows'
 import { recordSlot } from './timeline'
+import { sideRead, wakeOnNews } from './sideread'
 import {
   appStatesOfLines,
   isWake,
@@ -816,7 +817,7 @@ export const register: Register = (on, options) => {
     }
 
     // Frees simulator leases whose holder is gone, restores names. Emulator leases: keepEmulatorLeases.
-    const keepLeases = async (now: number, simOut: string, queue: Ticket[], agents: AgentRecord[], procs: Proc[]) => {
+    const keepLeases = async (now: number, listAt: number, simOut: string, queue: Ticket[], agents: AgentRecord[], procs: Proc[]) => {
       const devices = parseDevices(simOut)
       if (devices.length === 0) return
       const leases = await readLeases($, dir)
@@ -828,6 +829,7 @@ export const register: Register = (on, options) => {
       const busyUdids = busySimulators(agents, queue, devices, leases, now)
       const ctx = {
         now,
+        listAt,
         liveSessions: liveSessions(agents, new Set(procs.map(p => p.pid))),
         endedHolders: endedAndIdle(endedHolders(agents), leases, busyUdids),
         busyUdids,
@@ -863,6 +865,8 @@ export const register: Register = (on, options) => {
       const busyUdids = busySimulators(agents, queue, devices, leases, now)
       const ctx = {
         now,
+        // `running` is this round's process list.
+        listAt: now,
         liveSessions: liveSessions(agents, new Set(procs.map(p => p.pid))),
         endedHolders: endedAndIdle(endedHolders(agents), leases, busyUdids),
         busyUdids,
@@ -915,7 +919,21 @@ export const register: Register = (on, options) => {
       await run(argv)
     }
 
-    const sample = async (now: number, queue: Ticket[], agents: AgentRecord[]) => {
+    // `top` (about 0.8 s), the simulator list and heat run on their own, so a tick never waits for
+    // them and the timeline keeps its beat. An answer with something new starts an early update.
+    // A failed simulator read does not: the next beat takes it and counts the failure.
+    const topRead = sideRead(() => run(['top', '-l', '1', '-stats', 'pid,mem'], 20_000), wakeOnNews(wake))
+    const simsRead = sideRead(() => run(['xcrun', 'simctl', 'list', '-j']), wakeOnNews(wake))
+    const thermRead = sideRead(() => run(['pmset', '-g', 'therm'], THERM_TIMEOUT_MS), wakeOnNews(wake))
+    // Answers that come back while this session isn't sampling would be old by the next sample.
+    const dropSideReads = () => {
+      topRead.take()
+      simsRead.take()
+      thermRead.take()
+    }
+
+    // `isBeat`: the 3-second timer's tick, the only one that adds a timeline column.
+    const sample = async (now: number, queue: Ticket[], agents: AgentRecord[], isBeat: boolean) => {
       if (!wasLeader) {
         last = (await readJson<Snapshot>('latest.json')) ?? last
       }
@@ -924,51 +942,48 @@ export const register: Register = (on, options) => {
       const sysctl = parseSysctl(sysOut)
       // Under heavy load `top` itself is slow and adds to the problem.
       const isHeavy = cores > 0 && (sysctl.load[0] ?? 0) > 3 * cores
-      const isTopDue = !isHeavy && now - lastTop >= TOP_EVERY_MS
       const isSlowDue = now - lastSlow >= SLOW_EVERY_MS
       const isBooting = bootWatch.size > 0 || [...(sims?.values() ?? [])].some(s => s.state === 'Booting')
       const simsEveryMs = isBooting ? SIMS_BOOTING_EVERY_MS : isWatching ? SIMS_WATCHED_EVERY_MS : SIMS_EVERY_MS
-      const isSimsDue = isSimsStale || now - lastSims >= simsEveryMs
-      if (isSimsDue) isSimsStale = false
-      const isThermDue = now - lastTherm >= THERM_EVERY_MS
-      const others = Promise.all([
-        isTopDue ? run(['top', '-l', '1', '-stats', 'pid,mem'], 20_000) : Promise.resolve(''),
-        paused(),
-        isThermDue ? run(['pmset', '-g', 'therm'], THERM_TIMEOUT_MS) : Promise.resolve(''),
-      ])
-      const procs = parsePs(await run(['ps', '-Ao', 'pid=,ppid=,%cpu=,rss=,etime=,command=']))
+      // Take the answers first: `lastTop` must be current before the check, or `top` starts twice.
+      const top = topRead.take()
+      const simAnswer = simsRead.take()
+      const therm = thermRead.take()
+      if (top && top.text !== '') {
+        topMem = parseTop(top.text)
+        lastTop = top.at
+      }
+      if (!isHeavy && now - lastTop >= TOP_EVERY_MS) topRead.start(now)
+      if (now - lastTherm >= THERM_EVERY_MS && thermRead.start(now)) lastTherm = now
+      const [psOut, pausedPids] = await Promise.all([run(['ps', '-Ao', 'pid=,ppid=,%cpu=,rss=,etime=,command=']), paused()])
+      quietUntil = quietUntilAfter(now, lastSampleAt, quietUntil)
+      lastSampleAt = now
+
+      const procs = parsePs(psOut)
       // What this round runs (R2, R28). With no SDK an emulator stays an ordinary process, as today (R3).
       const isXcode = hasXcode
       const adbPath = adb
       const emulatorsOn = adbPath !== undefined ? emulatorProcs(procs) : []
       const plan = roundPlan({ hasSdk: adbPath !== undefined, hasXcode: isXcode, emulatorCount: emulatorsOn.length, adb: adbPath })
-      const isSimsRead = isSimsDue && plan.isSimctl
-      const [simOut, adbOut] = await Promise.all([
-        isSimsRead ? run(['xcrun', 'simctl', 'list', '-j']) : Promise.resolve(''),
-        plan.adbDevices ? run(plan.adbDevices) : Promise.resolve(''),
-      ])
-      const [topOut, pausedPids, thermOut] = await others
-      if (isThermDue) lastTherm = now
-      quietUntil = quietUntilAfter(now, lastSampleAt, quietUntil)
-      lastSampleAt = now
-
-      await keepReserved(now, procs).catch(() => undefined)
-      if (isTopDue && topOut !== '') {
-        topMem = parseTop(topOut)
-        lastTop = now
-      }
-      // The room step's simulators: this round's list, or none on a Mac without Xcode (R31).
-      let roomIos: Device[] | undefined = plan.isSimctl ? undefined : []
-      if (isSimsRead) {
+      // A stale list waits for a read that starts after the event, not one already going.
+      if (plan.isSimctl && (isSimsStale || now - lastSims >= simsEveryMs) && simsRead.start(now)) {
+        isSimsStale = false
         lastSims = now
+      }
+      const adbOut = plan.adbDevices ? await run(plan.adbDevices) : ''
+      await keepReserved(now, procs).catch(() => undefined)
+      // The room step's simulators: the list that just came back, or none on a Mac without Xcode (R31).
+      let roomIos: Device[] | undefined = plan.isSimctl ? undefined : []
+      if (simAnswer && plan.isSimctl) {
+        const simOut = simAnswer.text
         const isGood = isSimctlAnswer(simOut)
         simctlFailCount = simctlFails(simctlFailCount, isGood)
         simctl = simctlStatus(simctlFailCount, now)
-        if (isGood) simList = { at: now, text: simOut }
+        if (isGood) simList = { at: simAnswer.at, text: simOut }
         if (isGood) sims = parseSimctl(simOut)
         if (isGood) allSims = parseSimctl(simOut, true)
         if (isGood && sims) watchBoot(sims)
-        if (isGood) await keepLeases(now, simOut, queue, agents, procs).catch(() => undefined)
+        if (isGood) await keepLeases(now, simAnswer.at, simOut, queue, agents, procs).catch(() => undefined)
         if (isGood) roomIos = parseDevices(simOut)
       }
       // No Xcode: a known-empty simulator list, so nothing below runs simctl. Emulators never enter it.
@@ -1030,7 +1045,7 @@ export const register: Register = (on, options) => {
         savedDestination: ws => savedDestOf.get(ws)?.udid,
         paused: pausedPids,
         xcodeVersions: new Map([...versionOfApp].filter(([, v]) => v !== '')),
-        thermal: thermOut === '' ? undefined : parseTherm(thermOut),
+        thermal: therm && therm.text !== '' ? parseTherm(therm.text) : undefined,
         results: await readResults(now),
         isQueuePaused: await isPaused(),
         simctl: plan.isSimctl ? simctl : undefined,
@@ -1043,13 +1058,16 @@ export const register: Register = (on, options) => {
       snap.agentUsedAt = Object.fromEntries(usedAt)
       refreshHost(now, snap.host, plan.hostJobs)
       await addBranches(snap, now)
-      snap.timeline = recordSlot(last?.timeline, {
-        snap,
-        agents,
-        queue,
-        score: pressure(snap, settings).score,
-        booted: bootedCount(snap),
-      })
+      // An early update refreshes the rest of the panel; the timeline moves on the beat only.
+      snap.timeline = isBeat
+        ? recordSlot(last?.timeline, {
+          snap,
+          agents,
+          queue,
+          score: pressure(snap, settings).score,
+          booted: bootedCount(snap),
+        })
+        : (last?.timeline ?? [])
       last = snap
       await syncHold(snap)
       await $.fs.write(`${dir}/latest.json`, JSON.stringify(snap))
@@ -1079,6 +1097,8 @@ export const register: Register = (on, options) => {
     let lastTickAt = 0
     let isWakePending = false
     let isRerunWanted = false
+    // The timer fired while another update ran: its beat runs as soon as that one ends.
+    let isBeatWanted = false
 
     // Keeps this session's panel file in step with its pane, clears files of sessions that are gone,
     // and answers whether simaphore is on. Undefined when `ps` failed: keep the last answer.
@@ -1136,8 +1156,12 @@ export const register: Register = (on, options) => {
       }
     }
 
-    const tick = async () => {
-      if (isBusy) return
+    const tick = async (isBeat = false) => {
+      if (isBusy) {
+        if (isBeat) isBeatWanted = true
+
+        return
+      }
       isBusy = true
       lastTickAt = Date.now()
       try {
@@ -1145,6 +1169,7 @@ export const register: Register = (on, options) => {
         isOn = (await syncPanels()) ?? isOn
         if (!isOn) {
           await goQuiet(wasOn)
+          dropSideReads()
 
           return
         }
@@ -1155,11 +1180,12 @@ export const register: Register = (on, options) => {
         const agents = await readAgents(now)
         let snap: Snapshot | null
         if (await claimLeader(now)) {
-          snap = await sample(now, queue, agents)
+          snap = await sample(now, queue, agents, isBeat)
           wasLeader = true
         } else {
           wasLeader = false
           stopAppStreams()
+          dropSideReads()
           const raw = await readJson<Snapshot>('latest.json')
           snap = raw ? normalizeSnapshot(raw) : null
           // Follow the leader's Xcode check, so this session's own calls skip xcrun the same way.
@@ -1182,7 +1208,11 @@ export const register: Register = (on, options) => {
         // a failed tick is retried by the next one
       } finally {
         isBusy = false
-        if (isRerunWanted) {
+        if (isBeatWanted) {
+          isBeatWanted = false
+          isRerunWanted = false
+          void tick(true)
+        } else if (isRerunWanted) {
           isRerunWanted = false
           wake()
         }
@@ -1328,9 +1358,9 @@ export const register: Register = (on, options) => {
     }
 
     kick = wake
-    $.clock.every(TICK_MS, () => void tick())
+    $.clock.every(TICK_MS, () => void tick(true))
     $.clock.every(HEARTBEAT_MS, () => void heartbeat())
-    void tick()
+    void tick(true)
 
     // Build the helper in the background; without it everything keeps polling.
     void $.process.run([xcwatch, 'build'], { env: { SIMAPHORE_DIR: dir }, timeoutMs: BUILD_WATCHER_TIMEOUT_MS })

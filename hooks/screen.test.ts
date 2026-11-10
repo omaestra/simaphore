@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { scenarios } from './demo.fixture'
 import { fakeUi, linesOf, nodesOf } from './render.fixture'
-import { activityRuns, drawScreen, foldedText, laneLabelWidth, pressureRuns } from './screen'
+import { activityRuns, drawScreen, foldedText, laneLabelWidth, pressureRuns, timelineSpanText } from './screen'
 import type { ScreenActions, ScreenInput } from './screen'
 import { SIM_A, sim } from './rows.fixture'
 import { cellWidth } from './text'
@@ -173,6 +173,80 @@ test('the timeline has a lane per simulator, a budget row, a queue row, pressure
   expect(text).toContain('pressure')
   expect(text).toContain('░ boot  █ build  ▓ test  ▒ drive  · idle')
   expect(text).toMatch(/[▒█▓░]/)
+})
+
+/** The TIMELINE heading down to the legend. */
+const timelineOf = (input: ScreenInput) => {
+  const lines = linesOf(drawScreen(fakeUi, input))
+  const from = lines.findIndex(l => l.includes('TIMELINE'))
+
+  return lines.slice(from, lines.findIndex(l => l.includes('░ boot')) + 1)
+}
+
+test('timelineSpanText: whole minutes rounded down, seconds under a minute', () => {
+  expect([10, 19, 20, 52, 92, 200].map(timelineSpanText)).toEqual(['30 s', '57 s', '1 min', '2 min', '4 min', '10 min'])
+})
+
+test('the timeline heading says how much time fits at the pane’s width, at most 10 minutes', () => {
+  const heading = (columns: number) => timelineOf(screenOf('busy', columns))[0]
+
+  expect(heading(80)).toContain('TIMELINE  the last 2 min, newest on the right')
+  expect(heading(120)).toContain('TIMELINE  the last 4 min, newest on the right')
+  expect(heading(300)).toContain('TIMELINE  the last 10 min, newest on the right')
+})
+
+test('redraws between two ticks draw the same timeline', () => {
+  const s = screenOf('busy', 80)
+  const later = { ...s, frame: 7, input: { ...s.input, now: s.input.now + 2_900 } }
+
+  expect(timelineOf(later)).toEqual(timelineOf(s))
+})
+
+test('a new tick moves every drawn lane one column left and keeps its right edge', () => {
+  const s = screenOf('busy', 80)
+  const ring = s.input.snap.timeline ?? []
+  const last = ring[ring.length - 1]!
+  const next = { ...s, input: { ...s.input, snap: { ...s.input.snap, timeline: [...ring, { ...last, at: last.at + 3_100 }].slice(-200) } } }
+  const split = (line: string) => line.match(/^( [ABC] .*?\s)([█▓▒░·]+)( .*)$/)!
+  const lanesOf = (input: ScreenInput) => timelineOf(input).filter(l => /^ [ABC] /.test(l)).map(split)
+  const before = lanesOf(s)
+  const after = lanesOf(next)
+
+  expect(before.length).toBe(2)
+  expect(after.length).toBe(2)
+  before.forEach((b, i) => {
+    const a = after[i]!
+    expect(a[1]).toBe(b[1])
+    expect(a[2]!.slice(0, -1)).toBe(b[2]!.slice(1))
+    expect(a[3]).toBe(b[3])
+  })
+})
+
+/** The calm scene plus a simulator with a long name, seen in the ticks `from` to `to` of the 200 kept. */
+const withLongSim = (columns: number, from: number, to: number): ScreenInput => {
+  const s = screenOf('calm', columns)
+  const { snap } = s.input
+  const long = sim('DDDDDDDD-0000-4000-8000-000000000004', 'iPhone 17 Pro Max')
+  const timeline = (snap.timeline ?? []).map((t, i) => (i >= from && i <= to ? { ...t, sims: { ...t.sims, [long.udid]: ['█'] as [string] } } : t))
+
+  return { ...s, input: { ...s.input, snap: { ...snap, sims: [...snap.sims, long], letters: { ...snap.letters, [long.udid]: 'D' }, timeline } } }
+}
+
+/** Where the lane ends on screen: the width of the budget row. */
+const laneEnd = (input: ScreenInput) => cellWidth((timelineOf(input).find(l => l.includes('budget')) ?? '').trimEnd())
+
+test('on a wide pane the newest column stays put whatever the label widths', () => {
+  const plain = screenOf('calm', 260)
+
+  expect(laneEnd(withLongSim(260, 190, 199))).toBe(laneEnd(plain))
+  expect(laneEnd(plain)).toBe(224)
+  expect(laneEnd(withLongSim(230, 190, 199))).toBe(laneEnd(screenOf('calm', 230)))
+})
+
+test('a simulator only in the older part of the view gets its whole label', () => {
+  const lines = timelineOf(withLongSim(120, 108, 112))
+
+  expect(lines.some(l => l.startsWith(' D iPhone 17 Pro Max '))).toBe(true)
 })
 
 test('timeline is hidden when toggled off or when the pane is short', () => {

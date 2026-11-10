@@ -4,7 +4,7 @@ import type { AgentRecord, AppLife, RunResult, Snapshot, ThermalState, Ticket, T
 import { ANDROID_RUNTIME, IDLE_CPU, IN_USE_CPU, OWNER_COLOR, UUID_SOURCE, agentColor, assignLetters, flagValue, idleMinutesOf, isAtHomeScreen, orderQueue } from './logic'
 import type { Pose } from './mascot'
 import type { PhoneScreen } from './phone'
-import { ACTIVITY_PRIORITY, SLOT_COUNT, SLOT_MS } from './timeline'
+import { SLOT_MS } from './timeline'
 import { type LeaseView, originalNameOf } from './leases'
 import { TEST_KINDS, type WorkRow, findSim, shortFolder, ticketKind, workRows } from './rows'
 
@@ -700,39 +700,55 @@ export type TimelineLanes = {
 }
 
 const SPARK = '▁▂▃▄▅▆▇█'
-const rank = (char: string) => ACTIVITY_PRIORITY.indexOf(char)
 
-/** The last ten minutes squeezed into `width` columns; the strongest activity wins a column. */
-export function timelineLanes(timeline: TimelineSlot[], width: number, now: number, maxSims: number): TimelineLanes {
-  const span = SLOT_COUNT * SLOT_MS
-  const start = now - span
+/** Columns between two ticks: their spacing in whole ticks, never less than one. */
+const columnsBetween = (newer: TimelineSlot, older: TimelineSlot) =>
+  Math.max(1, Math.round((newer.at - older.at) / SLOT_MS))
+
+/**
+ * One column per recorded tick, the newest in the rightmost column. Each older tick sits its
+ * spacing (in whole ticks) to the left of the one after it, so a new tick moves everything exactly
+ * one column left, nothing moves until the next one, and a missed tick leaves an empty column.
+ */
+export function timelineLanes(timeline: TimelineSlot[], width: number, maxSims: number): TimelineLanes {
   const columns = Math.max(1, Math.floor(width))
-  const buckets: TimelineSlot[][] = Array.from({ length: columns }, () => [])
-  for (const slot of timeline) {
-    if (slot.at <= start || slot.at > now) continue
-    buckets[Math.min(columns - 1, Math.floor(((slot.at - start) / span) * columns))]!.push(slot)
+  const placed: (TimelineSlot | undefined)[] = Array.from({ length: columns }, () => undefined)
+  for (let i = timeline.length - 1, col = columns - 1; i >= 0 && col >= 0; i--) {
+    const slot = timeline[i]!
+    placed[col] = slot
+    const older = timeline[i - 1]
+    if (older !== undefined) col -= columnsBetween(slot, older)
   }
 
-  const udids = [...new Set(timeline.filter(s => s.at > start).flatMap(s => Object.keys(s.sims)))].sort()
+  const inView = placed.filter((s): s is TimelineSlot => s !== undefined)
+  const udids = [...new Set(inView.flatMap(s => Object.keys(s.sims)))].sort()
   const lanes = udids.map((udid): Lane => {
-    const picked = buckets.map(slots =>
-      slots
-        .map(s => s.sims[udid])
-        .filter((c): c is [string, string?] => c !== undefined)
-        .reduce<[string, string?] | undefined>((best, c) => (best && rank(best[0]) <= rank(c[0]) ? best : c), undefined),
-    )
+    const picked = placed.map(s => s?.sims[udid])
 
     return { udid, cells: picked.map(c => c?.[0] ?? ' '), colors: picked.map(c => c?.[1]) }
   })
 
-  const peaks = buckets.map(slots => (slots.length === 0 ? undefined : Math.max(...slots.map(s => s.p))))
+  const peaks = placed.map(s => s?.p)
 
   return {
     lanes,
-    overBudget: buckets.map(slots => slots.some(s => s.b > maxSims)),
-    queue: buckets.map(slots => slots.reduce((n, s) => n + (s.q?.length ?? 0), 0)),
+    overBudget: placed.map(s => s !== undefined && s.b > maxSims),
+    queue: placed.map(s => s?.q?.length ?? 0),
     pressure: peaks.map(p => (p === undefined ? ' ' : SPARK[Math.min(7, Math.floor((p / 100) * 8))]!)).join(''),
     pressureScores: peaks,
+  }
+}
+
+/** The view `columns` wide that ends at the same tick: the rightmost columns, minus lanes left with no mark. */
+export function rightmost(t: TimelineLanes, columns: number): TimelineLanes {
+  const keep = <T>(a: T[]) => a.slice(-columns)
+
+  return {
+    lanes: t.lanes.map(l => ({ udid: l.udid, cells: keep(l.cells), colors: keep(l.colors) })).filter(l => l.cells.some(ch => ch !== ' ')),
+    overBudget: keep(t.overBudget),
+    queue: keep(t.queue),
+    pressure: t.pressure.slice(-columns),
+    pressureScores: keep(t.pressureScores),
   }
 }
 

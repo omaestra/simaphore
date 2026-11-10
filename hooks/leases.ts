@@ -300,6 +300,8 @@ export function resolveTarget(spec: TargetSpec, devices: Device[], leases: Lease
 
 export type FreeContext = {
   now: number
+  /** When the device list was read; a lease claimed after that can't be in it. */
+  listAt: number
   liveSessions: Set<string>
   endedHolders: Set<string>
   busyUdids: Set<string>
@@ -313,7 +315,7 @@ export type FreeContext = {
 export function freeReason(lease: Lease, ctx: FreeContext): string | undefined {
   if (isAvdKey(lease.udid)) {
     if (ctx.avdKeys && !ctx.avdKeys.has(lease.udid)) return 'AVD deleted'
-  } else if (!ctx.deviceUdids.has(lease.udid)) {
+  } else if (!ctx.deviceUdids.has(lease.udid) && lease.claimedAt < ctx.listAt) {
     return 'simulator deleted'
   }
   if (!ctx.liveSessions.has(lease.session)) return 'session ended'
