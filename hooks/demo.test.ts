@@ -55,3 +55,12 @@ test('xcodeTest shows the owner\'s Xcode unit-test run as testing on its simulat
   expect(model.cards[0]?.user?.name).toContain('You')
   expect(model.noSimBuilds).toHaveLength(0)
 })
+
+test('android shows the emulator next to the simulator, held, with no alerts', () => {
+  const model = buildModel(scenarios.android())
+  const emulator = model.sims.find(r => r.udid === '@Pixel_9')
+
+  expect(model.header).toMatchObject({ hasEmulator: true, booted: 2, maxSims: 3, isOverBudget: false })
+  expect(emulator).toMatchObject({ name: 'Pixel_9', runtime: 'Android', holder: 'feature-a', letter: 'B' })
+  expect(model.alerts).toEqual([])
+})

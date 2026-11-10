@@ -1,7 +1,7 @@
 import type { Activity, Snapshot, TimelineSlot } from '../types'
 import { DEFAULT_SETTINGS } from './model'
 import type { ModelInput } from './model'
-import { NOW, SIM_A, SIM_B, SIM_C, agent, snapshot, ticket, tree } from './rows.fixture'
+import { NOW, SIM_A, SIM_B, SIM_C, agent, sim, snapshot, ticket, tree } from './rows.fixture'
 
 // Named scenarios for the model tests and for drawing the panel by hand.
 
@@ -102,4 +102,20 @@ export const xcodeTest = (): ModelInput =>
     timeline: history(1, { [SIM_A.udid]: ['▓', '#5B8DEF'] }, 40, 1),
   }))
 
-export const scenarios = { calm, overBudget, clash, sharedDerivedData, hungCoreSim, thermal, busy, xcodeTest }
+/** An Android emulator beside an iOS simulator: feature-a holds the emulator and drives its app. */
+export const EMULATOR = { ...sim('@Pixel_9', 'Pixel_9'), runtime: 'Android', memMb: 2600, cpu: 30, android: { serial: 'emulator-5554' } }
+
+export const android = (): ModelInput =>
+  input(snapshot({
+    sims: [{ ...SIM_A }, EMULATOR],
+    letters: { [SIM_A.udid]: 'A', [EMULATOR.udid]: 'B' },
+    idleSince: { [SIM_A.udid]: NOW - 12 * 60_000 },
+    pressureLevel: 1,
+    timeline: history(6, { [SIM_A.udid]: ['·'], [EMULATOR.udid]: ['▒', '#E8954A'] }, 60, 2),
+  }), {
+    agents: [agent('s1', 'feature-a', { pid: 101, activities: [driving(EMULATOR.udid)] }), agent('s2', 'feature-b', { pid: 102 })],
+    leases: [{ udid: EMULATOR.udid, label: 'feature-a', session: 's1', agent: 'main', lastUsed: NOW - 2000 }],
+    settings: { ...DEFAULT_SETTINGS, maxSims: 3 },
+  })
+
+export const scenarios = { calm, overBudget, clash, sharedDerivedData, hungCoreSim, thermal, busy, xcodeTest, android }

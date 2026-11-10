@@ -1,0 +1,34 @@
+#!/bin/bash
+# xcgradle <gradle-program> [args...]: queue one Gradle run like a build, pass it through when simaphore is off.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/lib.sh"
+# Leading target words (from the hook) are taken off, whether simaphore is on or not.
+# XCQ_SIM goes to xcq only; Gradle never sees it.
+sim=
+while [ $# -gt 0 ]; do
+  case $1 in ANDROID_SERIAL=*) export "$1" ;; XCQ_SIM=*) sim=${1#XCQ_SIM=} ;; *) break ;; esac
+  shift
+done
+# Only a live xcq may mark a call as already queued (XCQ_HELD alone is not enough).
+[ -n "$XCQ_HELD" ] && is_xcq_pid "$XCQ_HELD_BY" && exec "$@"
+sim_active || exec "$@"   # simaphore is off: no queue
+
+# Cap the workers on the command line only (R22, R34); the project is never written.
+has=0 kind=build
+[ "$(basename "$1")" = android ] && has=1   # the android CLI has no --max-workers; always a build
+[ "$(basename "$1")" = android ] || for a in "${@:2}"; do
+  case $a in --max-workers|--max-workers=*) has=1 ;; esac
+  case $a in -*) ;; *) case ${a##*:} in connected*|test*) kind=test ;; esac ;; esac
+done
+if [ $has = 0 ]; then prog=$1; shift; set -- "$prog" "--max-workers=${XCQ_JOBS:-6}" "$@"; fi
+export XCQ_KIND=$kind
+
+label=${XCQ_LABEL:-}
+if [ -z "$label" ]; then
+  top=$(git rev-parse --show-toplevel 2>/dev/null)
+  label=$(basename "${top:-$PWD}")
+fi
+[ -n "$sim" ] && export XCQ_SIM=$sim
+exec "$BIN/xcq" "gradle-$$" "$label" -- "$@"

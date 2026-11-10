@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { assignLetters, buildSnapshot, isHostDue, isSimctlAnswer, isSpmBusyIn, mergeHost, parseDf, parseDu, simctlFails, simctlStatus, letterOf, normalizeSnapshot, parsePs, parseSysctl, parseTherm } from './logic'
+import { assignLetters, buildSnapshot, developerFolder, isHostDue, roundPlan, simctlIn, isSimctlAnswer, isSpmBusyIn, mergeHost, parseDf, parseDu, simctlFails, simctlStatus, letterOf, normalizeSnapshot, parsePs, parseSysctl, parseTherm } from './logic'
 import { snapshot } from './rows.fixture'
 
 const SYSCTL = 'total = 2048.00M  used = 1946.00M  free = 102.00M  (encrypted)\n{ 1.0 1.0 1.0 }\n17179869184\n1\n'
@@ -176,4 +176,87 @@ test('host in the snapshot is carried from the previous one', () => {
   const base = { now: 1_000_000, procs: parsePs('1 0 5.0 1 /x\n'), topMem: new Map<number, number>(), sysctl: parseSysctl(SYSCTL), sims: null, claudeCwd: new Map<number, string>(), cores: 4 }
   const first = buildSnapshot({ ...base, prev: null, host: { freeGb: 12 } })
   expect(buildSnapshot({ ...base, now: 1_003_000, prev: first }).host).toEqual({ freeGb: 12 })
+})
+
+// ---------- what a round runs ----------
+
+test('developerFolder: DEVELOPER_DIR wins over xcode-select, an .app means its Developer folder (D11)', () => {
+  const xc = '/Applications/Xcode.app/Contents/Developer'
+  expect(developerFolder(undefined, `${xc}\n`)).toBe(xc)
+  expect(developerFolder('/X/Beta.app/Contents/Developer/', xc)).toBe('/X/Beta.app/Contents/Developer')
+  expect(developerFolder('/X/Beta.app', xc)).toBe('/X/Beta.app/Contents/Developer')
+  expect(developerFolder('', '/Library/Developer/CommandLineTools')).toBe('/Library/Developer/CommandLineTools')
+  expect(developerFolder(undefined, '')).toBe(undefined)
+  expect(developerFolder('  ', undefined)).toBe(undefined)
+  expect(simctlIn(xc)).toBe(`${xc}/usr/bin/simctl`)
+})
+
+const adb = '/sdk/platform-tools/adb'
+
+test('roundPlan: no SDK and Xcode found is today\'s round exactly (R2, R3)', () => {
+  const today = { isSimctl: true, isPlutil: true, hostJobs: ['df', 'dd', 'dev', 'xcode'] }
+  expect(roundPlan({ hasSdk: false, hasXcode: true, emulatorCount: 0 })).toEqual(today)
+  // A stray qemu without an SDK still runs no adb.
+  expect(roundPlan({ hasSdk: false, hasXcode: true, emulatorCount: 2 })).toEqual(today)
+})
+
+test('roundPlan: no Xcode runs no simctl, plutil or Xcode folder sizes (R28)', () => {
+  const quiet = { isSimctl: false, isPlutil: false, hostJobs: ['df', 'xcode'] }
+  expect(roundPlan({ hasSdk: true, hasXcode: false, emulatorCount: 0, adb })).toEqual(quiet)
+  // Neither Xcode nor the SDK gets the same quiet round (D20).
+  expect(roundPlan({ hasSdk: false, hasXcode: false, emulatorCount: 0 })).toEqual(quiet)
+})
+
+test('roundPlan: adb runs only while an emulator shows in ps (D18)', () => {
+  expect(roundPlan({ hasSdk: true, hasXcode: true, emulatorCount: 0, adb }).adbDevices).toBe(undefined)
+  expect(roundPlan({ hasSdk: true, hasXcode: true, emulatorCount: 1, adb }).adbDevices).toEqual([adb, 'devices'])
+  expect(roundPlan({ hasSdk: true, hasXcode: false, emulatorCount: 1, adb }).adbDevices).toEqual([adb, 'devices'])
+})
+
+// ---------- emulators in the snapshot ----------
+
+const QEMU = '/Users/me/Library/Android/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64 -avd Pixel_9'
+const emuBase = () => ({
+  now: 1_000_000,
+  procs: parsePs(`1 0 1.0 1000 /sbin/launchd\n40 1 0.5 2048 /sdk/emulator/emulator -avd Pixel_9\n41 40 12.0 2097152 ${QEMU}\n`),
+  topMem: new Map<number, number>(),
+  sysctl: parseSysctl(SYSCTL),
+  sims: new Map(),
+  claudeCwd: new Map<number, string>(),
+  prev: null,
+  cores: 4,
+})
+
+test('with no emulators and Xcode found the snapshot is byte-identical to today (R3)', () => {
+  const today = buildSnapshot(emuBase())
+  expect(JSON.stringify(buildSnapshot({ ...emuBase(), emulators: [], hasXcode: true }))).toBe(JSON.stringify(today))
+})
+
+test('an emulator joins the simulators, keyed by AVD name, with its memory and CPU (R5)', () => {
+  const snap = buildSnapshot({ ...emuBase(), emulators: [{ avd: 'Pixel_9', pid: 41, serial: 'emulator-5554', isReady: true }] })
+  expect(snap.sims).toEqual([
+    { udid: '@Pixel_9', name: 'Pixel_9', runtime: 'Android', state: 'Booted', memMb: 2048, cpu: 12, isAppRunning: false, android: { serial: 'emulator-5554' } },
+  ])
+  expect(snap.groups.find(g => g.id === 'sim:@Pixel_9')?.label).toBe('sim Pixel_9 (Android)')
+  expect(snap.idleSince['@Pixel_9']).toBe(1_000_000)
+})
+
+test('an emulator is booting until adb says it finished, and may have no serial yet', () => {
+  const snap = buildSnapshot({ ...emuBase(), emulators: [{ avd: 'Pixel_9', pid: 41, isReady: false }] })
+  expect(snap.sims[0]?.state).toBe('Booting')
+  expect(snap.sims[0]?.android).toEqual({})
+})
+
+test('before simctl answers, an emulator is listed once and never as a simulator', () => {
+  const snap = buildSnapshot({ ...emuBase(), sims: null, emulators: [{ avd: 'Pixel_9', pid: 41, isReady: true }] })
+  expect(snap.sims.map(s => s.udid)).toEqual(['@Pixel_9'])
+})
+
+test('hasXcode is written only when false, and normalizeSnapshot keeps it and the serial', () => {
+  expect('hasXcode' in buildSnapshot({ ...emuBase(), hasXcode: true })).toBe(false)
+  const quiet = buildSnapshot({ ...emuBase(), hasXcode: false, emulators: [{ avd: 'Pixel_9', pid: 41, serial: 'emulator-5554', isReady: true }] })
+  expect(quiet.hasXcode).toBe(false)
+  const back = normalizeSnapshot(JSON.parse(JSON.stringify(quiet)))
+  expect(back.hasXcode).toBe(false)
+  expect(back.sims[0]?.android).toEqual({ serial: 'emulator-5554' })
 })

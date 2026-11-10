@@ -32,6 +32,8 @@ import {
   buildTreeMembers,
   shellQuote,
   shimPrefix,
+  queueGradle,
+  gradleCalls,
   waitForSim,
   simOfProc,
   sparkline,
@@ -280,6 +282,139 @@ test('rewrite: prefix string, background only for real builds, others untouched'
   expect(rewriteBash('ls -la', CTX)).toBeUndefined()
   expect(rewriteBash('xcrun simctl boot ABC', CTX)).toBeUndefined()
   expect(shellQuote("a'b")).toBe(`'a'\\''b'`)
+})
+
+test('rewrite: gradle builds go through xcgradle, everything else stays as typed', () => {
+  const X = "'/r/simaphore/bin/xcgradle' "
+  const queued = (cmd: string) => rewriteBash(cmd, CTX)
+  for (const [cmd, want] of [
+    ['./gradlew assembleDebug', `${X}./gradlew assembleDebug`],
+    ['gradle build', `${X}gradle build`],
+    ['app/gradlew test', `${X}app/gradlew test`],
+    ['/opt/homebrew/bin/gradle build', `${X}/opt/homebrew/bin/gradle build`],
+    ['JAVA_HOME=x ./gradlew build', `JAVA_HOME=x ${X}./gradlew build`],
+    ['./gradlew clean', `${X}./gradlew clean`],
+    ['cd app && ./gradlew build && echo ok', `cd app && ${X}./gradlew build && echo ok`],
+    ['if true; then ./gradlew build; fi', `if true; then ${X}./gradlew build; fi`],
+    ['./gradlew tasks && ./gradlew build', `./gradlew tasks && ${X}./gradlew build`],
+  ] as const) {
+    expect(queued(cmd), cmd).toEqual({ command: expect.stringContaining(want), isQueued: true })
+    expect(queueGradle(cmd, '/r/simaphore'), cmd).toBe(want)
+  }
+  expect(queued('./gradlew build')?.command).toStartWith('export PATH=')
+  for (const cmd of ['./gradlew --version', './gradlew tasks', './gradlew help', './gradlew', './gradlew assembleDebug --stop']) {
+    expect(queued(cmd), cmd).toEqual({ command: expect.any(String), isQueued: false })
+    expect(queueGradle(cmd, '/r')).toBeUndefined()
+  }
+  expect(queued('gradle --version')).toBeUndefined()
+  for (const cmd of [
+    'echo "./gradlew build"',
+    "sh -c './gradlew build'",
+    'cat <<EOF\n./gradlew build\nEOF',
+    'grep gradlew build.gradle',
+    'ls gradlew',
+  ]) {
+    expect(queueGradle(cmd, '/r'), cmd).toBeUndefined()
+  }
+  expect(queueGradle("cat <<EOF\n./gradlew build\nEOF\n./gradlew test", '/r')).toBe(
+    "cat <<EOF\n./gradlew build\nEOF\n'/r/bin/xcgradle' ./gradlew test",
+  )
+  expect(queueGradle("cat <<-'END'\n\t./gradlew build\n\tEND\n./gradlew test", '/r')).toBe(
+    "cat <<-'END'\n\t./gradlew build\n\tEND\n'/r/bin/xcgradle' ./gradlew test",
+  )
+  // Shell arithmetic is not a heredoc.
+  expect(queueGradle('echo $((1<<2))\n./gradlew build', '/r')).toBe("echo $((1<<2))\n'/r/bin/xcgradle' ./gradlew build")
+})
+
+test('rewrite: two gradle calls, one building and one pass-through, give one insertion', () => {
+  expect(queueGradle('./gradlew --version; ./gradlew build', '/r')).toBe("./gradlew --version; '/r/bin/xcgradle' ./gradlew build")
+  expect(queueGradle('./gradlew build | tee log\n./gradlew --stop', '/r')).toBe("'/r/bin/xcgradle' ./gradlew build | tee log\n./gradlew --stop")
+})
+
+test('waitForSim: a gradle body is queued inside the wrapped text', () => {
+  const X = "'/r/simaphore/bin/xcgradle' "
+  const simple = waitForSim(CTX, '/x', 'U1', './gradlew installDebug')
+  expect(simple).toEndWith(` && ${X}./gradlew installDebug`)
+  expect(simple).toContain('"$PATH"')
+  const compound = waitForSim(CTX, '/x', 'U1', 'cd app && ./gradlew test')
+  expect(compound).toEndWith(` && {\ncd app && ${X}./gradlew test\n}`)
+  expect(waitForSim(CTX, '/x', 'U1', 'gradle --version')).not.toContain('xcgradle')
+})
+
+test('gradleCalls: building calls with their own serial; pass-through left out', () => {
+  expect(gradleCalls('./gradlew installDebug')).toEqual([{ tasks: ['installDebug'] }])
+  expect(gradleCalls("ANDROID_SERIAL='emulator-5556' ./gradlew :app:installDebug -q; ./gradlew --version; ./gradlew assembleDebug")).toEqual([
+    { tasks: [':app:installDebug'], serial: 'emulator-5556' },
+    { tasks: ['assembleDebug'] },
+  ])
+  expect(gradleCalls('./gradlew tasks && echo "./gradlew build"')).toEqual([])
+})
+
+test('rewrite: a gradle target adds the two words to device-installing calls only', () => {
+  const T = { serial: 'emulator-5554', key: '@Pixel_9' }
+  const X = "'/r/simaphore/bin/xcgradle' "
+  const W = "ANDROID_SERIAL='emulator-5554' XCQ_SIM='@Pixel_9' "
+  const ctx = { ...CTX, gradleTarget: T }
+  for (const [cmd, want] of [
+    ['./gradlew installDebug', `${X}${W}./gradlew installDebug`],
+    ['cd app && ./gradlew :app:connectedDebugAndroidTest', `cd app && ${X}${W}./gradlew :app:connectedDebugAndroidTest`],
+    ['./gradlew assembleDebug && ./gradlew installDebug', `${X}./gradlew assembleDebug && ${X}${W}./gradlew installDebug`],
+    ['./gradlew assembleDebug installDebug', `${X}${W}./gradlew assembleDebug installDebug`],
+    ['./gradlew assembleDebug', `${X}./gradlew assembleDebug`],
+  ] as const) {
+    expect(queueGradle(cmd, '/r/simaphore', T), cmd).toBe(want)
+    expect(rewriteBash(cmd, ctx)?.command, cmd).toEndWith(want)
+  }
+  expect(queueGradle('./gradlew installDebug', '/r/simaphore')).toBe(`${X}./gradlew installDebug`)
+  expect(rewriteBash('./gradlew installDebug', CTX)?.command).toEndWith(`${X}./gradlew installDebug`)
+  expect(waitForSim(ctx, '/x', 'U1', './gradlew installDebug')).toEndWith(` && ${X}${W}./gradlew installDebug`)
+})
+
+const P9 = { key: '@Pixel_9', serial: 'emulator-5554' }
+const P8 = { key: '@Pixel_8', serial: 'emulator-5556' }
+const XG = "'/r/bin/xcgradle' "
+
+test('rewrite: android build and run that builds go through xcgradle', () => {
+  expect(queueGradle('android build', '/r')).toBe(`${XG}android build`)
+  expect(queueGradle('android --sdk /x build', '/r')).toBe(`${XG}android --sdk /x build`)
+  expect(queueGradle('cd app && android build -- --info', '/r', undefined, [P9])).toBe(`cd app && ${XG}android build -- --info`)
+  expect(queueGradle('android run', '/r')).toBe(`${XG}android run`)
+})
+
+test('rewrite: android run gets XCQ_SIM for its emulator', () => {
+  expect(queueGradle('android run --device=emulator-5554', '/r', undefined, [P9])).toBe(`${XG}XCQ_SIM='@Pixel_9' android run --device=emulator-5554`)
+  expect(queueGradle('android run', '/r', undefined, [P9])).toBe(`${XG}XCQ_SIM='@Pixel_9' android run`)
+  expect(queueGradle('android run', '/r', undefined, [P9, P8])).toBe(`${XG}android run`)
+  expect(queueGradle('android run --device=emulator-5556', '/r', undefined, [P9, P8])).toBe(`${XG}XCQ_SIM='@Pixel_8' android run --device=emulator-5556`)
+  expect(queueGradle('android run --device=emulator-5558', '/r', undefined, [P9])).toBe(`${XG}android run --device=emulator-5558`)
+  expect(queueGradle('android build', '/r', { serial: 'emulator-5554', key: '@Pixel_9' }, [P9])).toBe(`${XG}android build`)
+})
+
+test('rewrite: android calls that only use a device are not queued', () => {
+  for (const cmd of ['android run --apks app.apks', 'android run app.apk', 'android install app.apk', 'android --help', 'android build --help']) {
+    expect(queueGradle(cmd, '/r', undefined, [P9]), cmd).toBeUndefined()
+    expect(rewriteBash(cmd, CTX), cmd).toBeUndefined()
+  }
+})
+
+test('rewrite: gradle and android calls in one command are each handled', () => {
+  const T = { serial: 'emulator-5554', key: '@Pixel_9' }
+  expect(queueGradle('./gradlew installDebug && android run', '/r', T, [P9])).toBe(
+    `${XG}ANDROID_SERIAL='emulator-5554' XCQ_SIM='@Pixel_9' ./gradlew installDebug && ${XG}XCQ_SIM='@Pixel_9' android run`,
+  )
+  expect(gradleCalls('./gradlew installDebug && android run')).toEqual([{ tasks: ['installDebug'] }])
+  expect(gradleCalls('android build')).toEqual([])
+})
+
+test('waitForSim: an android run body is queued with its emulator', () => {
+  const ctx = { ...CTX, root: '/r', emulatorsOn: [P9] }
+  expect(waitForSim(ctx, '/x', 'U1', 'android run')).toEndWith(` && ${XG}XCQ_SIM='@Pixel_9' android run`)
+})
+
+test('rewrite: android build runs in the background', () => {
+  const r = rewriteBash('android build', { ...CTX, root: '/r' })
+  expect(r?.isQueued).toBe(true)
+  expect(r?.command).toEndWith(`${XG}android build`)
 })
 
 test('activityOf: bash', () => {
@@ -769,4 +904,71 @@ test('appsInSims: app processes inside a simulator, with its UDID', () => {
   ].join('\n')
   expect(appsInSims(ps)).toEqual([{ pid: 501, udid: UDID_A }])
   expect(appsInSims('')).toEqual([])
+})
+
+test('activityOf: emulator and android boot', () => {
+  expect(activityOf('Bash', { command: 'emulator @Pixel_9 -no-window' })).toMatchObject({ kind: 'boot', verb: 'boot', sim: '@Pixel_9' })
+  expect(activityOf('Bash', { command: 'env FOO=1 $ANDROID_HOME/emulator/emulator -avd Pixel_9' })).toMatchObject({ kind: 'boot', sim: '@Pixel_9' })
+  expect(activityOf('Bash', { command: 'android emulator start Pixel_9' })).toMatchObject({ kind: 'boot', verb: 'boot', sim: '@Pixel_9' })
+  expect(activityOf('Bash', { command: 'android emulator stop' })).toMatchObject({ kind: 'boot', verb: 'shutdown' })
+  expect(activityOf('Bash', { command: 'emulator -list-avds' })).toBeNull()
+  expect(activityOf('Bash', { command: 'emulator -help' })).toBeNull()
+  expect(activityOf('Bash', { command: 'android emulator list' })).toBeNull()
+  expect(activityOf('Bash', { command: 'grep emulator file' })).toBeNull()
+})
+
+test('activityOf: adb device verbs', () => {
+  const of = (command: string) => activityOf('Bash', { command })
+  expect(of('adb install -r /x/out/app-debug.apk')).toMatchObject({ kind: 'install', detail: 'install app-debug.apk' })
+  expect(of('adb -s emulator-5554 install-multiple a.apk b.apk')).toMatchObject({ kind: 'install', detail: 'install a.apk' })
+  expect(of('adb uninstall com.x.app')).toMatchObject({ kind: 'install' })
+  expect(of('adb shell am start -n com.x/.Main')).toMatchObject({ kind: 'launch', verb: 'launch' })
+  expect(of('adb shell am force-stop com.x')).toMatchObject({ kind: 'launch', verb: 'terminate' })
+  expect(of('adb shell am kill com.x')).toMatchObject({ kind: 'launch', verb: 'terminate' })
+  expect(of('adb shell input tap 1 2')).toMatchObject({ kind: 'verify', verb: 'input' })
+  expect(of('adb exec-out screencap -p > s.png')).toMatchObject({ kind: 'verify', verb: 'screenshot' })
+  expect(of('adb shell screencap /sdcard/s.png')).toMatchObject({ kind: 'verify', verb: 'screenshot' })
+  expect(of('adb logcat -d')).toMatchObject({ kind: 'verify', verb: 'logcat' })
+  expect(of('adb shell ls /sdcard')).toMatchObject({ kind: 'verify', verb: 'shell' })
+  expect(of('adb push a.txt /sdcard/')).toMatchObject({ kind: 'verify', detail: 'push a.txt' })
+  expect(of('adb pull /sdcard/b.txt .')).toMatchObject({ kind: 'verify', verb: 'pull' })
+  expect(of('adb -s emulator-5554 emu kill')).toMatchObject({ kind: 'boot', verb: 'shutdown' })
+  expect(of('timeout 30 adb logcat -d')).toMatchObject({ kind: 'verify' })
+  expect(of('FOO=1 adb shell input text hi')).toMatchObject({ kind: 'verify' })
+  expect(of('adb install a.apk')?.sim).toBeUndefined()
+  for (const none of ['adb devices', 'adb start-server', 'adb version', 'adb kill-server', 'adb reconnect', 'echo adb install x.apk']) {
+    expect(of(none)).toBeNull()
+  }
+})
+
+test('activityOf: android CLI', () => {
+  const of = (command: string) => activityOf('Bash', { command })
+  expect(of('android install app.apk')).toMatchObject({ kind: 'install', detail: 'install app.apk' })
+  expect(of('android install')).toMatchObject({ kind: 'install' })
+  expect(of('android run --device emulator-5554')).toMatchObject({ kind: 'run' })
+  expect(of('android build')).toMatchObject({ kind: 'build' })
+  for (const word of ['screen capture', 'layout', 'input tap 1 2', 'profiler start', 'device hub']) {
+    expect(of(`android ${word}`)).toMatchObject({ kind: 'verify' })
+  }
+  expect(of('android --help')).toBeNull()
+  expect(of('android build --help')).toBeNull()
+  expect(of('android')).toBeNull()
+})
+
+test('activityOf: gradle', () => {
+  const of = (command: string) => activityOf('Bash', { command })
+  expect(of('./gradlew assembleDebug')).toMatchObject({ kind: 'build', detail: 'building assembleDebug' })
+  expect(of('gradle :app:bundleRelease')).toMatchObject({ kind: 'build' })
+  expect(of('/p/gradlew build')).toMatchObject({ kind: 'build' })
+  expect(of('./gradlew installDebug')).toMatchObject({ kind: 'install' })
+  expect(of('./gradlew connectedDebugAndroidTest')).toMatchObject({ kind: 'test', detail: 'testing connectedDebugAndroidTest' })
+  expect(of('./gradlew pixel2api30DebugAndroidTest')).toMatchObject({ kind: 'test' })
+  expect(of('./gradlew testDebugUnitTest')).toMatchObject({ kind: 'test' })
+  expect(of('./gradlew check')).toMatchObject({ kind: 'test' })
+  expect(of('env FOO=1 ./gradlew assembleDebug')).toMatchObject({ kind: 'build' })
+  expect(of('timeout 30 ./gradlew assembleDebug')).toMatchObject({ kind: 'build' })
+  expect(of('./gradlew assembleDebug')?.sim).toBeUndefined()
+  for (const none of ['./gradlew --stop', './gradlew --version', './gradlew -v', './gradlew', './gradlew tasks', './gradlew help', './gradlew --status', './gradlew -? assembleDebug', 'echo ./gradlew build']) {
+    expect(of(none)).toBeNull()
+  }
 })
