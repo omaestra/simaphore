@@ -19,6 +19,7 @@ import {
   shutdownArgv,
 } from './android'
 import type { AdbDevice, EmulatorProc } from './android'
+import { helperProcs, helperSysctl, hostCpuPct, parseHelperLine, thermalOf, type HelperLine } from './sample'
 import { envByPid, holdText, holdingTree, isTestEnv, xcodeAppOf, xcodeAppPids } from './builds'
 import {
   ANDROID_RUNTIME,
@@ -53,7 +54,9 @@ import {
   parseSysctl,
   parseTherm,
   parseTicket,
-  parseTop,
+  readTop,
+  topReadings,
+  type TopCarry,
   QUEUE_NOTE,
   gradleCalls,
   XCODE_APP_TOOLS,
@@ -147,7 +150,8 @@ const leasesAtom = atom({ plugin: 'simaphore', key: 'leases' } as const, [])
 const reservedAtom = atom({ plugin: 'simaphore', key: 'reserved' } as const, [])
 
 const TICK_MS = 3_000
-const TOP_EVERY_MS = 10_000
+// A helper line later than this is not the beat any more: the timer takes over.
+const HELPER_LATE_MS = 4_500
 const SLOW_EVERY_MS = 30_000
 const SIMS_EVERY_MS = 10_000
 const SIMS_BOOTING_EVERY_MS = 3_000
@@ -337,8 +341,8 @@ export const register: Register = (on, options) => {
   let isWatching = false
   // A sim or exit event came: the next sample reads the simulator list whatever the timer says.
   let isSimsStale = false
-  // Stops the watcher and the app log streams; set by session.start.
-  let stopLive: (() => void) | undefined
+  // Stops the watcher, `top`, the helper and the app log streams; set by session.start.
+  let stopLive: ((isEnd?: boolean) => void) | undefined
   // NO_COLOR, read once when the session starts.
   let isMono = false
   // The Claude Code theme: read when the session starts and again whenever it is changed.
@@ -346,10 +350,11 @@ export const register: Register = (on, options) => {
   let wasLeader = false
   let last: Snapshot | null = null
   let topMem = new Map<number, number>()
+  // %CPU per pid from the same stream: the CPU of other accounts' processes.
+  let topCpu = new Map<number, number>()
   let sims: Map<string, SimInfo> | null = null
   let claudeCwd = new Map<number, string>()
   let cores = 0
-  let lastTop = 0
   let lastSlow = 0
   let lastSims = 0
   let simctl: { ok: boolean; failedAt?: number } | undefined
@@ -919,47 +924,47 @@ export const register: Register = (on, options) => {
       await run(argv)
     }
 
-    // `top` (about 0.8 s), the simulator list and heat run on their own, so a tick never waits for
+    // The simulator list and heat run on their own, so a tick never waits for
     // them and the timeline keeps its beat. An answer with something new starts an early update.
     // A failed simulator read does not: the next beat takes it and counts the failure.
-    const topRead = sideRead(() => run(['top', '-l', '1', '-stats', 'pid,mem'], 20_000), wakeOnNews(wake))
     const simsRead = sideRead(() => run(['xcrun', 'simctl', 'list', '-j']), wakeOnNews(wake))
     const thermRead = sideRead(() => run(['pmset', '-g', 'therm'], THERM_TIMEOUT_MS), wakeOnNews(wake))
     // Answers that come back while this session isn't sampling would be old by the next sample.
     const dropSideReads = () => {
-      topRead.take()
       simsRead.take()
       thermRead.take()
     }
 
-    // `isBeat`: the 3-second timer's tick, the only one that adds a timeline column.
+    // `isBeat`: the helper's line (the 3-second timer when there is none), the only tick that adds a timeline column.
     const sample = async (now: number, queue: Ticket[], agents: AgentRecord[], isBeat: boolean) => {
       if (!wasLeader) {
         last = (await readJson<Snapshot>('latest.json')) ?? last
       }
+      syncSampler()
+      // Once: lines can arrive while this sample awaits.
+      const h = helperLine()
+      if (h) cores = h.cur.cores
       if (cores === 0) cores = Number((await run(['sysctl', '-n', 'hw.ncpu'])).trim()) || 0
-      const sysOut = await run(['sysctl', '-n', 'vm.swapusage', 'vm.loadavg', 'hw.memsize', 'kern.memorystatus_vm_pressure_level'])
-      const sysctl = parseSysctl(sysOut)
-      // Under heavy load `top` itself is slow and adds to the problem.
-      const isHeavy = cores > 0 && (sysctl.load[0] ?? 0) > 3 * cores
+      const sysctl = h
+        ? helperSysctl(h.cur)
+        : parseSysctl(await run(['sysctl', '-n', 'vm.swapusage', 'vm.loadavg', 'hw.memsize', 'kern.memorystatus_vm_pressure_level']))
       const isSlowDue = now - lastSlow >= SLOW_EVERY_MS
       const isBooting = bootWatch.size > 0 || [...(sims?.values() ?? [])].some(s => s.state === 'Booting')
       const simsEveryMs = isBooting ? SIMS_BOOTING_EVERY_MS : isWatching ? SIMS_WATCHED_EVERY_MS : SIMS_EVERY_MS
-      // Take the answers first: `lastTop` must be current before the check, or `top` starts twice.
-      const top = topRead.take()
       const simAnswer = simsRead.take()
       const therm = thermRead.take()
-      if (top && top.text !== '') {
-        topMem = parseTop(top.text)
-        lastTop = top.at
-      }
-      if (!isHeavy && now - lastTop >= TOP_EVERY_MS) topRead.start(now)
-      if (now - lastTherm >= THERM_EVERY_MS && thermRead.start(now)) lastTherm = now
-      const [psOut, pausedPids] = await Promise.all([run(['ps', '-Ao', 'pid=,ppid=,%cpu=,rss=,etime=,command=']), paused()])
+      syncTop()
+      if (!h && now - lastTherm >= THERM_EVERY_MS && thermRead.start(now)) lastTherm = now
+      // Other accounts' numbers come only from `top`: without them, `ps` stays.
+      const fromHelper = h && topCpu.size > 0 ? helperProcs(h.prev, h.cur, { mem: topMem, cpu: topCpu }) : undefined
+      const [psOut, pausedPids] = await Promise.all([
+        fromHelper ? '' : run(['ps', '-Ao', 'pid=,ppid=,%cpu=,rss=,etime=,command=']),
+        paused(),
+      ])
       quietUntil = quietUntilAfter(now, lastSampleAt, quietUntil)
       lastSampleAt = now
 
-      const procs = parsePs(psOut)
+      const procs = fromHelper ? fromHelper.procs : parsePs(psOut)
       // What this round runs (R2, R28). With no SDK an emulator stays an ordinary process, as today (R3).
       const isXcode = hasXcode
       const adbPath = adb
@@ -1029,8 +1034,9 @@ export const register: Register = (on, options) => {
       const snap = buildSnapshot({
         now,
         procs,
-        topMem,
+        topMem: fromHelper ? fromHelper.memMb : topMem,
         sysctl,
+        cpuPct: h ? hostCpuPct(h.prev, h.cur) : undefined,
         sims: iosSims,
         emulators,
         hasXcode: isXcode,
@@ -1045,7 +1051,7 @@ export const register: Register = (on, options) => {
         savedDestination: ws => savedDestOf.get(ws)?.udid,
         paused: pausedPids,
         xcodeVersions: new Map([...versionOfApp].filter(([, v]) => v !== '')),
-        thermal: therm && therm.text !== '' ? parseTherm(therm.text) : undefined,
+        thermal: h ? thermalOf(h.cur.thermal) : therm && therm.text !== '' ? parseTherm(therm.text) : undefined,
         results: await readResults(now),
         isQueuePaused: await isPaused(),
         simctl: plan.isSimctl ? simctl : undefined,
@@ -1185,6 +1191,8 @@ export const register: Register = (on, options) => {
         } else {
           wasLeader = false
           stopAppStreams()
+          stopTop()
+          stopSampler()
           dropSideReads()
           const raw = await readJson<Snapshot>('latest.json')
           snap = raw ? normalizeSnapshot(raw) : null
@@ -1275,6 +1283,9 @@ export const register: Register = (on, options) => {
 
     const xcwatch = `${$.plugin.root}/bin/xcwatch`
     let isHelperBuilt = false
+    let isBuildDone = false
+    // Set when the session ends: no stream may start after that.
+    let isEnded = false
     let wantedWatch: { isLeader: boolean; pids: number[] } | undefined
     let stopWatcher: (() => void) | undefined
     let watchKey = ''
@@ -1292,7 +1303,7 @@ export const register: Register = (on, options) => {
 
     // One watcher per session: restarted at once when its arguments change, with a backoff when it dies.
     const syncWatcher = () => {
-      if (!isHelperBuilt || !wantedWatch) return
+      if (isEnded || !isHelperBuilt || !wantedWatch) return
       const args = watchArgs({ dir, ...wantedWatch })
       const key = args.join('\n')
       if (stopWatcher ? key === watchKey : Date.now() < watchRetryAt) return
@@ -1307,6 +1318,115 @@ export const register: Register = (on, options) => {
         watchFailures = Date.now() - watchStartedAt > WATCHER_HEALTHY_MS ? 1 : watchFailures + 1
         watchRetryAt = Date.now() + restartDelayMs(watchFailures)
       })
+    }
+
+    // One `top` kept open: a fresh one costs about 1.5 s of CPU, this one about 0.2 s per reading.
+    // A reading never wakes a tick; each beat takes the latest one.
+    let stopTopStream: (() => void) | undefined
+    let topStartedAt = 0
+    let topFailures = 0
+    let topRetryAt = 0
+
+    function stopTop() {
+      stopTopStream?.()
+      stopTopStream = undefined
+      topMem = new Map()
+      topCpu = new Map()
+    }
+
+    function startTop() {
+      const args = ['top', '-l', '0', '-s', '3', '-stats', 'pid,cpu,mem']
+      const argv = isHelperBuilt ? [xcwatch, 'tether', '--', ...args] : args
+      let carry: TopCarry = null
+      let isFirst = true
+      topStartedAt = Date.now()
+      let mine: (() => void) | undefined
+      mine = stopTopStream = follow({ argv, env: { SIMAPHORE_DIR: dir } }, lineReader(lines => {
+        if (stopTopStream !== mine) return
+        const out = topReadings(carry, lines)
+        carry = out.carry
+        for (const text of out.readings) {
+          const reading = readTop(text, isFirst)
+          isFirst = false
+          topMem = reading.mem
+          topCpu = reading.cpu
+        }
+      }), () => {
+        stopTopStream = undefined
+        topMem = new Map()
+        topCpu = new Map()
+        topFailures = Date.now() - topStartedAt > WATCHER_HEALTHY_MS ? 1 : topFailures + 1
+        topRetryAt = Date.now() + restartDelayMs(topFailures)
+      })
+    }
+
+    // Waits for the helper build to finish, so the tether is used whenever it can be.
+    function syncTop() {
+      if (isEnded || !isBuildDone || stopTopStream || Date.now() < topRetryAt) return
+      startTop()
+    }
+
+    // The helper's sampler: each of its lines is the beat. Late or dead, the timer and `ps` take over.
+    let stopSamplerStream: (() => void) | undefined
+    let samplerStartedAt = 0
+    let samplerFailures = 0
+    let samplerRetryAt = 0
+    let helperPrev: HelperLine | undefined
+    let helperCur: HelperLine | undefined
+    let helperLineAt = 0
+
+    function stopSampler() {
+      stopSamplerStream?.()
+      stopSamplerStream = undefined
+      helperPrev = undefined
+      helperCur = undefined
+    }
+
+    const samplerFailed = () => {
+      samplerFailures = Date.now() - samplerStartedAt > WATCHER_HEALTHY_MS ? 1 : samplerFailures + 1
+      samplerRetryAt = Date.now() + restartDelayMs(samplerFailures)
+    }
+
+    function startSampler() {
+      samplerStartedAt = Date.now()
+      let mine: (() => void) | undefined
+      mine = stopSamplerStream = follow(
+        { argv: [xcwatch, 'sample', '--every', String(TICK_MS / 1000)], env: { SIMAPHORE_DIR: dir } },
+        lineReader(lines => {
+          if (stopSamplerStream !== mine) return
+          for (const l of lines) {
+            const line = parseHelperLine(l)
+            if (!line) continue
+            helperPrev = helperCur
+            helperCur = line
+            helperLineAt = Date.now()
+          }
+          // The first line is a baseline, not a beat.
+          if (helperPrev) void tick(true)
+        }),
+        () => {
+          stopSamplerStream = undefined
+          helperPrev = undefined
+          helperCur = undefined
+          samplerFailed()
+        },
+      )
+    }
+
+    function syncSampler() {
+      if (isEnded || !isHelperBuilt) return
+      if (stopSamplerStream) {
+        if (Date.now() - Math.max(helperLineAt, samplerStartedAt) < HELPER_LATE_MS) return
+        stopSampler()
+        samplerFailed()
+      } else if (Date.now() >= samplerRetryAt) startSampler()
+    }
+
+    // The last two lines, only while the sampler runs and its newest line is fresh.
+    function helperLine() {
+      if (!stopSamplerStream || !helperPrev || !helperCur || Date.now() - helperLineAt >= HELPER_LATE_MS) return undefined
+
+      return { prev: helperPrev, cur: helperCur }
     }
 
     const streamRetryAt = new Map<string, number>()
@@ -1350,15 +1470,20 @@ export const register: Register = (on, options) => {
       }
     }
 
-    stopLive = () => {
+    stopLive = (isEnd = false) => {
+      if (isEnd) isEnded = true
       stopWatcher?.()
       stopWatcher = undefined
       isWatching = false
       stopAppStreams()
+      stopTop()
+      stopSampler()
     }
 
     kick = wake
-    $.clock.every(TICK_MS, () => void tick(true))
+    $.clock.every(TICK_MS, () => {
+      if (!helperLine()) void tick(true)
+    })
     $.clock.every(HEARTBEAT_MS, () => void heartbeat())
     void tick(true)
 
@@ -1366,15 +1491,19 @@ export const register: Register = (on, options) => {
     void $.process.run([xcwatch, 'build'], { env: { SIMAPHORE_DIR: dir }, timeoutMs: BUILD_WATCHER_TIMEOUT_MS })
       .then(r => {
         isHelperBuilt = r.exitCode === 0
+        isBuildDone = true
         syncWatcher()
       })
-      .catch(() => undefined)
+      .catch(() => {
+        isBuildDone = true
+      })
 
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
-    stopLive?.()
+    // After a /clear or a resume this process goes on sampling, with no new session.start: keep the streams.
+    if (e.reason !== 'clear' && e.reason !== 'resume') stopLive?.(true)
     try {
       await $.process.run(['rm', '-f', `${dir}/agents/${me}.json`, panelFile()])
     } catch {

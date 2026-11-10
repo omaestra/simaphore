@@ -1,7 +1,7 @@
 #!/bin/bash
 # Tests for bin/xcwatch. Compiles into a temp SIMAPHORE_DIR; uses fake Devices folders only.
 XW="$(cd "$(dirname "$0")/.." && pwd)/bin/xcwatch"
-BASE=${TMPDIR:-/tmp}
+BASE=${TMPDIR:-/tmp}; BASE=${BASE%/}
 mkdir -p "$BASE"
 export SIMAPHORE_DIR=$(mktemp -d "$BASE/xcwatch-test.XXXXXX")
 T=$(mktemp -d "$BASE/xcwatch-work.XXXXXX")
@@ -26,6 +26,7 @@ check "path prints nothing" "$("$XW" path)" ""
 "$XW" path >/dev/null; check "path exits 69" $? 69
 "$XW" wait --timeout 1 "$T/dir" >/dev/null; check "wait exits 69" $? 69
 "$XW" events >/dev/null; check "events exits 69" $? 69
+"$XW" sample >/dev/null; check "sample exits 69" $? 69
 "$XW" bogus 2>/dev/null; check "unknown subcommand exits 64" $? 64
 
 echo "== build"
@@ -98,6 +99,46 @@ stop s
 bash -c '"$0" events --dir "$1" > "$2/o.out" 2>&1 < /dev/null & echo $! > "$2/o.pid"; sleep 1' "$XW" "$T/dir" "$T"
 soon "! kill -0 $(cat "$T/o.pid") 2>/dev/null"; check "exits when its parent exits" $? 0
 check "events leaves no files in the folder" "$(ls -A "$SIMAPHORE_DIR/bin" | wc -l | tr -d ' ')" 1
+
+echo "== sample"
+"$XW" sample --every 2>/dev/null; check "--every with no value exits 64" $? 64
+"$XW" sample --every abc 2>/dev/null; check "--every with a bad value exits 64" $? 64
+"$XW" sample --every 0 2>/dev/null; check "--every 0 exits 64" $? 64
+"$XW" sample --every -1 2>/dev/null; check "--every negative exits 64" $? 64
+"$XW" sample --bogus 2>/dev/null; check "unknown option exits 64" $? 64
+"$XW" sample --every 0.5 > "$T/m.out" 2>&1 < /dev/null & echo $! > "$T/m.pid"
+soon "[ \$(wc -l < '$T/m.out') -ge 6 ]"; check "six lines on a 0.5 s beat" $? 0
+stop m
+# one python run checks every line; prints name=ok for each passed check
+res=$(/usr/bin/python3 -I -c '
+import json, sys
+ncpu, mem, me = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+keys = ["kind","at","cores","ticks","swap","load","mem","pressure","thermal","mine","others"]
+ls = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+raw = open(sys.argv[1]).read()
+ok = lambda n, c: print(n + "=" + ("ok" if c else "bad"))
+ok("json", len(ls) >= 4 and all(list(d) == keys and d["kind"] == "sample" for d in ls))
+ok("compact", all(" " not in l.split("\"mine\"")[0] for l in raw.splitlines()))
+at = [d["at"] for d in ls]
+ok("nodrift", all(abs(a - (at[0] + n * 500)) <= 300 for n, a in enumerate(at)))
+ok("noburst", all(b - a >= 300 for a, b in zip(at, at[1:])))
+d = ls[-1]
+m = {r[0]: r for r in d["mine"]}
+ok("me", me in m and m[me][5] != "" and len(m[me]) == 6 and m[me][3] > 0 and m[me][4] > 0)
+o = {r[0]: r for r in d["others"]}
+ok("launchd", 1 in o and o[1][2] == 0 and o[1][3] == "/sbin/launchd" and 1 not in m)
+ok("load", len(d["load"]) == 3 and all(0 <= x < 1000 for x in d["load"]))
+ok("cores", d["cores"] == ncpu)
+ok("mem", d["mem"] == mem)
+ok("ticks", len(d["ticks"]) == 4 and d["ticks"][2] > 0 and ls[-1]["ticks"][0] >= ls[0]["ticks"][0])
+ok("swap", len(d["swap"]) == 2 and d["swap"][0] >= d["swap"][1] >= 0)
+ok("pressure", d["pressure"] in (1, 2, 4) and d["thermal"] in (0, 1, 2, 3))
+' "$T/m.out" "$(sysctl -n hw.ncpu)" "$(sysctl -n hw.memsize)" $$ 2>&1)
+for n in json compact nodrift noburst me launchd load cores mem ticks swap pressure; do
+  check "sample $n" "$(echo "$res" | grep "^$n=")" "$n=ok"
+done
+bash -c '"$0" sample --every 0.5 > "$1/q.out" 2>&1 < /dev/null & echo $! > "$1/q.pid"; sleep 1' "$XW" "$T"
+soon "[ -s '$T/q.out' ]"; soon "! kill -0 $(cat "$T/q.pid") 2>/dev/null"; check "sample exits when its parent exits" $? 0
 
 echo "== tether"
 check "runs the command, keeps its output" "$("$XW" tether -- echo hi)" hi

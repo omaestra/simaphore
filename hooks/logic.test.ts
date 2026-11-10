@@ -24,6 +24,8 @@ import {
   parseSimctl,
   parseSysctl,
   parseTop,
+  readTop,
+  topReadings,
   rewriteBash,
   sharedSims,
   updateSimWaits,
@@ -104,7 +106,7 @@ test('snapshot totals, session link for builds, top overrides rss', () => {
   const snap = buildSnapshot({
     now: 1_000_000,
     procs: parsePs(PS),
-    topMem: parseTop('PID    MEM\n103    2G\n104    512M+\n'),
+    topMem: parseTop('PID    MEM\n103    2G\n104    512M+\n').mem,
     sysctl: parseSysctl(
       'total = 15360.00M  used = 14950.00M  free = 410.00M  (encrypted)\n{ 7.62 8.00 9.10 }\n17179869184\n',
     ),
@@ -904,6 +906,72 @@ test('appsInSims: app processes inside a simulator, with its UDID', () => {
   ].join('\n')
   expect(appsInSims(ps)).toEqual([{ pid: 501, udid: UDID_A }])
   expect(appsInSims('')).toEqual([])
+})
+
+const topText = (total: number, rows: number, cpu = 1.5) =>
+  [
+    `Processes: ${total} total, 4 running, 978 sleeping, 6024 threads `,
+    'Load Avg: 3.1, 3.2, 3.3',
+    '',
+    'PID    %CPU MEM  ',
+    ...Array.from({ length: rows }, (_, i) => `${100 + i}  ${cpu}  ${i + 1}M `),
+  ].join('\n')
+
+test('parseTop reads both row layouts and skips headers', () => {
+  const both = parseTop('Processes: 3 total\nPID    %CPU MEM  \n98522  0.0  409M \n77  12.5  1.2G+\n5  3.0  900K-\n\n')
+  expect([...both.mem]).toEqual([[98522, 409], [77, 1.2 * 1024], [5, 900 / 1024]])
+  expect([...both.cpu]).toEqual([[98522, 0], [77, 12.5], [5, 3]])
+  const memOnly = parseTop('PID    MEM\n77  1.2G\n1234  45M+\n')
+  expect(memOnly.mem.get(1234)).toBe(45)
+  expect(memOnly.cpu.size).toBe(0)
+})
+
+test('topReadings finishes a reading by its row count, without waiting for the next header', () => {
+  const { readings, carry } = topReadings(null, topText(3, 3).split('\n'))
+  expect(readings.length).toBe(1)
+  expect(parseTop(readings[0]!).mem.size).toBe(3)
+  expect(carry).toBeNull()
+})
+
+test('topReadings finishes a short reading when the next header arrives', () => {
+  const lines = [...topText(5, 2).split('\n'), ...topText(2, 2).split('\n')]
+  const { readings } = topReadings(null, lines)
+  expect(readings.map(r => parseTop(r).mem.size)).toEqual([2, 2])
+})
+
+test('topReadings drops junk before the first header', () => {
+  const { readings } = topReadings(null, ['  12  1.0  3M', 'junk', ...topText(1, 1).split('\n')])
+  expect(readings.length).toBe(1)
+  expect(parseTop(readings[0]!).mem.size).toBe(1)
+})
+
+test('topReadings gives the same readings however the lines are split', () => {
+  const lines = [...topText(4, 4).split('\n'), ...topText(3, 3, 9).split('\n')]
+  const whole = topReadings(null, lines).readings
+  expect(whole.length).toBe(2)
+  for (const size of [1, 3, 5]) {
+    let carry = null as ReturnType<typeof topReadings>['carry']
+    const got: string[] = []
+    for (let i = 0; i < lines.length; i += size) {
+      const r = topReadings(carry, lines.slice(i, i + size))
+      carry = r.carry
+      got.push(...r.readings)
+    }
+    expect(got).toEqual(whole)
+  }
+})
+
+test('readTop ignores the first reading cpu and keeps the later ones', () => {
+  const text = topText(2, 2, 7)
+  expect(readTop(text, true).cpu.size).toBe(0)
+  expect(readTop(text, true).mem.size).toBe(2)
+  expect(readTop(text, false).cpu.get(100)).toBe(7)
+})
+
+test('a CPU % passed in wins over the process sum', () => {
+  const base = { now: 1, procs: parsePs(PS), topMem: new Map<number, number>(), sysctl: parseSysctl(''), sims: null, claudeCwd: new Map<number, string>(), prev: null, cores: 4 }
+  expect(buildSnapshot({ ...base, cpuPct: 12.34 }).cpuPct).toBe(12.3)
+  expect(buildSnapshot({ ...base, cpuPct: 250 }).cpuPct).toBe(100)
 })
 
 test('activityOf: emulator and android boot', () => {

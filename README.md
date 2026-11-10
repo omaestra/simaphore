@@ -159,6 +159,13 @@ simulator they start is held for the agent.
 **Will it block my own commands?**
 No. Commands you type yourself with `!` are never blocked.
 
+**Does it slow my Mac down?**
+Very little. One session reads the Mac for all of them, every 3 seconds. A small
+helper, built from source with Xcode's Swift compiler the first time, reads the
+numbers straight from macOS, and one `top` stays open for every process's CPU
+and memory, other accounts included. Together they use about 4 seconds of CPU
+per minute. Without the helper, simaphore falls back to `ps`, `sysctl` and `pmset`.
+
 **A command was held back. Why?**
 It needed a simulator or emulator another agent holds, or the queue was full. The
 panel says which. Turning simaphore off releases everything.
