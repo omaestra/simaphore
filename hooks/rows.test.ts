@@ -3,6 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import { NOW, SIM_A, agent, fixture, snapshot, ticket } from './rows.fixture'
 import { folderOfWorkspace } from './logic'
 import {
+  findSim,
   poseOfKind,
   shortFolder,
   titleOf,
@@ -99,4 +100,12 @@ test('titleOf takes about six words, skips slash commands and clips to 40 cells'
   expect(titleOf('/simaphore demo busy')).toBeUndefined()
   expect(titleOf('   ')).toBeUndefined()
   expect(titleOf('a'.repeat(60))?.length).toBe(40)
+})
+
+test('findSim matches an @ emulator key exactly, a UDID in any case, and a name', () => {
+  const emu = { ...SIM_A, udid: '@Pixel_9', name: 'Pixel_9', runtime: 'Android' }
+  expect(findSim('@Pixel_9', [SIM_A, emu])).toBe(emu)
+  expect(findSim('@pixel_9', [SIM_A, emu])).toBeUndefined()
+  expect(findSim(SIM_A.udid.toLowerCase(), [SIM_A, emu])).toBe(SIM_A)
+  expect(findSim(SIM_A.name, [SIM_A, emu])).toBe(SIM_A)
 })

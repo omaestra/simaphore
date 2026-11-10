@@ -448,6 +448,46 @@ XCQ_SESSION=s2 "$XCQ" q10 beta -- /bin/sh -c "$(job B 30)" sh test -destination 
 wait_for "grep -q waiting=sim '$Q/q10.ticket' 2>/dev/null"
 kill -TERM $p2; wait $p2 2>/dev/null
 check "SIGTERM while waiting for a simulator removes the ticket" "$(ls "$Q")" ""
+echo "== emulator key from XCQ_SIM"
+EP=$ST/ps; echo "100 1 /sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64 -avd Pixel_9" > "$EP"
+EL=$SIMAPHORE_DIR/leases/@Pixel_9.lease
+# emujob <ticket> <label> <session> <XCQ_SIM value>: a build-kind command that names its emulator
+emujob() { XCQ_FAKE_PS=$EP XCQ_SIM=$4 XCQ_SESSION=$3 "$XCQ" "$1" "$2" -- /bin/sh -c "$(job E 1)" sh build; }
+sim_reset
+XCQ_FAKE_PS=$EP XCQ_SESSION=s1 XCQ_LABEL=alpha "$XCSIM" claim @Pixel_9 >/dev/null
+emujob e1 beta s2 @Pixel_9 >"$SIMAPHORE_DIR/out" & p2=$!
+wait_for "grep -q waiting=sim '$Q/e1.ticket' 2>/dev/null"
+grep -q waiting=sim "$Q/e1.ticket" && ok "emulator: ticket says waiting=sim" || bad "emulator: no waiting=sim"
+grep -q '^sim=@Pixel_9$' "$Q/e1.ticket" && ok "emulator: ticket shows the device" || bad "emulator: ticket sim: $(cat "$Q/e1.ticket")"
+sleep 1.5
+check "emulator: does not start while another holds it" "$(order)" ""
+grep -qxF "xcq: emulator held by alpha" "$SIMAPHORE_DIR/out" && ok "emulator held message" || bad "emulator held message: $(cat "$SIMAPHORE_DIR/out")"
+XCQ_SESSION=s1 "$XCSIM" free @Pixel_9
+wait $p2
+check "emulator: starts once the lease is free" "$(order)" "E "
+grep -q '^session=s2$' "$EL" && ok "emulator: waiter holds the lease" || bad "emulator: lease not taken"
+
+sim_reset
+XCQ_FAKE_PS=$EP XCQ_SESSION=s2 XCQ_LABEL=beta "$XCSIM" claim @Pixel_9 >/dev/null
+sed -i '' 's/^lastUsed=.*/lastUsed=1/' "$EL"
+emujob e2 beta s2 @Pixel_9 >/dev/null
+[ "$(sed -n 's/^lastUsed=//p' "$EL")" -gt 1000000000000 ] && ok "emulator: lease touched at the end" || bad "emulator: lease not touched"
+
+sim_reset
+echo "@Pixel_9" > "$SIMAPHORE_DIR/reserved"
+emujob e3 beta s2 @Pixel_9 >"$SIMAPHORE_DIR/out"; check "emulator: reserved exits 4" $? 4
+grep -qxF "xcq: emulator is reserved" "$SIMAPHORE_DIR/out" && ok "emulator: reserved message" || bad "emulator: reserved message: $(cat "$SIMAPHORE_DIR/out")"
+check "emulator: reserved, nothing ran" "$(order)" ""
+
+sim_reset
+for bad_key in '@bad name' "$SU" ''; do
+  emujob e4 beta s2 "$bad_key" >/dev/null
+done
+check "invalid XCQ_SIM is not gated" "$(order)/$(ls "$SIMAPHORE_DIR/leases" 2>/dev/null | wc -l | tr -d ' ')" "E E E /0"
+
+sim_reset
+XCQ_SIM=@Pixel_9 XCQ_KIND=build "$XCQ" e5 beta -- /bin/sh -c 'echo "[${XCQ_SIM-unset}][${XCQ_KIND-unset}]"' 2>/dev/null | grep -qx '\[unset\]\[unset\]' && ok "build does not inherit XCQ_SIM or XCQ_KIND" || bad "XCQ_SIM or XCQ_KIND leaked"
+
 echo "== device ids are not gated"
 sim_reset
 XCQ_SESSION=s1 "$XCQ" d1 alpha -- /bin/sh -c "$(job A 1)" sh test -destination "platform=iOS,id=00008110-001234567890401E" >/dev/null
@@ -657,5 +697,21 @@ reset
 printf ' 800 1 /bin/bash /x/bin/xcq q1 Z -- /usr/bin/xcodebuild build\n 801 800 /usr/bin/xcodebuild -jobs 6 build\n' > "$PS_FILE"
 XCQ_FAKE_PS=$PS_FILE "$XCQ" t1 A "$(job A 0)" >/dev/null
 check "runs at once" "$(order)" "A "
+
+echo "== Gradle clients outside the queue"
+GW="/jdk/bin/java -classpath /p/gradle/wrapper/gradle-wrapper.jar org.gradle.wrapper.GradleWrapperMain"
+GM="/jdk/bin/java -cp /g/lib/gradle-launcher.jar org.gradle.launcher.GradleMain"
+outn() { printf '%b' "$1" > "$PS_FILE"; ( . "$(dirname "$0")/../bin/lib.sh"; XCQ_FAKE_PS=$PS_FILE outside_builds ); }
+check "wrapper client counts" "$(outn " 700 1 $GW assembleDebug\n")" 1
+check "wrapper client under xcq (parent) does not" "$(outn " 10 1 /bin/bash /x/bin/xcq g1 L -- ./gradlew\n 700 10 $GW assembleDebug\n")" 0
+check "wrapper client under xcq (grandparent) does not" "$(outn " 10 1 /x/bin/xcq g1 L -- ./gradlew\n 11 10 sh ./gradlew\n 700 11 $GW assembleDebug\n")" 0
+check "installed gradle client counts" "$(outn " 701 1 $GM build\n")" 1
+check "GradleDaemon and KotlinCompileDaemon do not" "$(outn " 702 1 /jdk/bin/java org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.5\n 703 1 /jdk/bin/java org.jetbrains.kotlin.daemon.KotlinCompileDaemon\n")" 0
+check "--stop does not" "$(outn " 704 1 $GW --stop\n")" 0
+check "tasks does not" "$(outn " 705 1 $GW tasks\n")" 0
+check "-q help does not" "$(outn " 706 1 $GW -q help\n")" 0
+check "no words after the class do not" "$(outn " 707 1 $GW\n")" 0
+check "--stacktrace assembleDebug counts" "$(outn " 708 1 $GW --stacktrace assembleDebug\n")" 1
+check "one xcodebuild plus one Gradle client is 2" "$(outn " 900 1 /usr/bin/xcodebuild -scheme X build\n 700 1 $GW assembleDebug\n")" 2
 
 finish

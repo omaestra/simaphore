@@ -2,14 +2,33 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { AgentRecord, AppLife, Confirm, HostInfo, PerfEvent, RunResult, Snapshot, Ticket } from '../types'
+import {
+  adbFollowUps,
+  adbIn,
+  avdFolder,
+  avdKey,
+  avdKeysIn,
+  emulatorProcs,
+  gradleTarget,
+  isAvdKey,
+  isBootCompleted,
+  pairEmulators,
+  parseAdbDevices,
+  parseAvdName,
+  sdkRoots,
+  shutdownArgv,
+} from './android'
+import type { AdbDevice, EmulatorProc } from './android'
 import { helperProcs, helperSysctl, hostCpuPct, parseHelperLine, thermalOf, type HelperLine } from './sample'
 import { envByPid, holdText, holdingTree, isTestEnv, xcodeAppOf, xcodeAppPids } from './builds'
 import {
+  ANDROID_RUNTIME,
   activityOf,
   allButOne,
   ancestorsOf,
   buildSnapshot,
   derivedDataPath,
+  developerFolder,
   finishActivity,
   freshResults,
   groupOf,
@@ -39,6 +58,7 @@ import {
   topReadings,
   type TopCarry,
   QUEUE_NOTE,
+  gradleCalls,
   XCODE_APP_TOOLS,
   XCODE_BUILD_TOOLS,
   appsInSims,
@@ -48,17 +68,23 @@ import {
   waitForSim,
   userStatePaths,
   rewriteBash,
+  roundPlan,
+  simctlIn,
   statusLine,
 } from './logic'
-import type { Proc, SimInfo } from './logic'
+import type { EmulatorSeen, HostJob, Proc, ShimContext, SimInfo } from './logic'
 import {
   agentUsedAt,
   ambiguousNote,
+  androidCallsOf,
+  androidRoute,
   busyDeny,
   busySimulators,
   canFreeLeases,
   debuggedByOwner,
   claimOutcome,
+  emulatorDevice,
+  emulatorsOf,
   endedAndIdle,
   endedHolders,
   freeReason,
@@ -84,7 +110,7 @@ import {
   suggestFree,
   useSimulator,
 } from './leases'
-import type { Lease } from './leases'
+import type { Device, Lease } from './leases'
 import { CONFIRM_MS, sameConfirm, selectedSim } from './confirm'
 import { scenarios } from './demo.fixture'
 import { FIELDS, drawSettings, stepped, toggledName, valuesOf } from './settings'
@@ -154,6 +180,9 @@ const LEADER_STALE_MS = 10_000
 const BRANCH_EVERY_MS = 30_000
 const RESTORE_EVERY_MS = 60_000
 const SIM_CALL_MS = 5_000
+const ADB_CALL_MS = 5_000
+/** After `emu kill`, how long the emulator may take to save and quit before room is made again. */
+const EMU_KILL_WAIT_MS = 30_000
 /** How often an open Xcode run or test call looks for the app it started. */
 const APP_POLL_MS = 2_000
 const HELPER_NAME_MAX = 30
@@ -274,10 +303,12 @@ const ALL_SIMS_DENY = "simaphore: commands on all simulators at once aren't allo
 type Granted = {
   command?: string
   wrapped?: boolean
-  touch?: string
+  touch?: string[]
   note?: string
   device?: string
-  claimed?: string
+  claimed?: string[]
+  /** Every `@` emulator key the command targets, in order. */
+  keys?: string[]
 }
 type Route = { deny: string } | Granted
 
@@ -331,7 +362,19 @@ export const register: Register = (on, options) => {
   let lastTherm = 0
   // Slow host facts: what the background jobs found, and when each was last tried.
   let hostFound: HostInfo = {}
-  const hostTried = { df: 0, dd: 0, dev: 0, xcode: 0 }
+  const hostTried: Record<HostJob, number> = { df: 0, dd: 0, dev: 0, xcode: 0 }
+  // The Xcode check (D11) and the SDK check (R1): first run before the first round, then with the xcode job.
+  let toolsCheckedAt = 0
+  let hasXcode = true
+  let developerPath: string | undefined
+  let adb: string | undefined
+  // The AVD folder, only ever listed (R16); and the emulator the room step last told to quit.
+  let avdDir = ''
+  let emuKill: { key: string; at: number } | undefined
+  // Emulators: the AVD each serial runs (asked once, D17), the serials done booting, and the last adb list.
+  const avdOfSerial = new Map<string, string>()
+  const readySerials = new Set<string>()
+  let adbSeen: AdbDevice[] = []
   // Apps running in each booted simulator: found by a background job, never inside a tick.
   let appsFound: Record<string, string[]> = {}
   let appStatesFound: Record<string, Record<string, AppLife>> = {}
@@ -625,11 +668,59 @@ export const register: Register = (on, options) => {
       await $.fs.write(`${dir}/hold`, holdText(t, holdSince)).catch(() => undefined)
     }
 
+    // Whether Xcode (D11) and the Android SDK (R1) are here: file checks plus today's `xcode-select -p`.
+    // Never `xcrun`, which may open an install dialog on a Mac without developer tools.
+    const checkTools = async (now: number) => {
+      toolsCheckedAt = now
+      const developer = developerFolder(await $.env.get('DEVELOPER_DIR'), (await run(['xcode-select', '-p'])).trim())
+      const isXcode = developer !== undefined && (await $.fs.exists(simctlIn(developer)).catch(() => false))
+      const env = { ANDROID_HOME: await $.env.get('ANDROID_HOME'), ANDROID_SDK_ROOT: await $.env.get('ANDROID_SDK_ROOT') }
+      avdDir = avdFolder({
+        ANDROID_AVD_HOME: await $.env.get('ANDROID_AVD_HOME'),
+        ANDROID_EMULATOR_HOME: await $.env.get('ANDROID_EMULATOR_HOME'),
+        ANDROID_USER_HOME: await $.env.get('ANDROID_USER_HOME'),
+      }, homeDir)
+      let found: string | undefined
+      for (const root of sdkRoots(env, homeDir)) {
+        if (await $.fs.exists(adbIn(root)).catch(() => false)) {
+          found = adbIn(root)
+          break
+        }
+      }
+      hasXcode = isXcode
+      developerPath = isXcode ? developer : undefined
+      adb = found
+    }
+
+    // After `adb devices`: each new serial's AVD name (D17), and the boot state of those not up yet.
+    const askAdb = async (adbPath: string, devices: AdbDevice[], running: EmulatorProc[]) => {
+      const listed = new Set(devices.map(d => d.serial))
+      for (const serial of [...avdOfSerial.keys()]) if (!listed.has(serial)) avdOfSerial.delete(serial)
+      for (const serial of [...readySerials]) if (!listed.has(serial)) readySerials.delete(serial)
+      const asks = adbFollowUps(adbPath, devices, avdOfSerial, readySerials, new Set(running.map(e => e.avd)))
+      await Promise.all(asks.map(async argv => {
+        const serial = argv[2]!
+        const out = await run(argv, ADB_CALL_MS)
+        if (argv[3] !== 'emu') {
+          if (isBootCompleted(out)) readySerials.add(serial)
+
+          return
+        }
+        const name = parseAvdName(out)
+        const old = avdOfSerial.get(serial)
+        // The port went to another emulator: its boot state starts over.
+        if (old !== undefined && name !== old) readySerials.delete(serial)
+        if (name === undefined) avdOfSerial.delete(serial)
+        else avdOfSerial.set(serial, name)
+      }))
+    }
+
     // Each slow command runs on its own, never inside a tick; a failure is retried after its full wait.
-    const refreshHost = (now: number, carried: HostInfo | undefined) => {
+    // Only the jobs this round's plan lists may start (no Xcode: no DerivedData or simulator data sizes).
+    const refreshHost = (now: number, carried: HostInfo | undefined, jobs: HostJob[]) => {
       const home = homeDir
-      const start = (key: keyof typeof hostTried, readAt: number | undefined, everyMs: number, job: () => Promise<HostInfo>) => {
-        if (!isHostDue(now, hostTried[key], readAt, everyMs)) return
+      const start = (key: HostJob, readAt: number | undefined, everyMs: number, job: () => Promise<HostInfo>) => {
+        if (!jobs.includes(key) || !isHostDue(now, hostTried[key], readAt, everyMs)) return
         hostTried[key] = now
         void job().then(found => {
           hostFound = mergeHost(hostFound, found)
@@ -650,10 +741,12 @@ export const register: Register = (on, options) => {
 
         return { simDevicesMb: mb, simDevicesAt: mb === undefined ? undefined : Date.now() }
       })
+      // The D11 check again (skipped when the first-round check just ran), then the version when Xcode is found.
       start('xcode', carried?.xcodeAt, HOST_XCODE_MS, async () => {
-        const path = (await run(['xcode-select', '-p'])).trim()
-        if (path === '') return {}
-        const app = path.replace(/\/Contents\/Developer\/?$/, '')
+        if (now - toolsCheckedAt >= HOST_XCODE_MS) await checkTools(now)
+        const path = developerPath
+        if (path === undefined) return {}
+        const app = path.replace(/\/Contents\/Developer$/, '')
         const version = (await run(['plutil', '-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', `${app}/Contents/Info.plist`])).trim()
 
         return { xcodePath: path, xcodeVersion: version === '' ? undefined : version, xcodeAt: Date.now() }
@@ -728,7 +821,7 @@ export const register: Register = (on, options) => {
       }
     }
 
-    // Frees leases whose holder is gone, restores names, makes room.
+    // Frees simulator leases whose holder is gone, restores names. Emulator leases: keepEmulatorLeases.
     const keepLeases = async (now: number, listAt: number, simOut: string, queue: Ticket[], agents: AgentRecord[], procs: Proc[]) => {
       const devices = parseDevices(simOut)
       if (devices.length === 0) return
@@ -736,7 +829,7 @@ export const register: Register = (on, options) => {
       const known = new Set(devices.map(d => d.udid))
       const found = [...Object.entries(last?.agentUsedAt ?? {}), ...agentUsedAt(agents, devices, leases)]
       for (const [udid, at] of found) usedAt.set(udid, Math.max(usedAt.get(udid) ?? 0, at))
-      for (const udid of usedAt.keys()) if (!known.has(udid)) usedAt.delete(udid)
+      for (const udid of usedAt.keys()) if (!isAvdKey(udid) && !known.has(udid)) usedAt.delete(udid)
 
       const busyUdids = busySimulators(agents, queue, devices, leases, now)
       const ctx = {
@@ -749,35 +842,86 @@ export const register: Register = (on, options) => {
       }
       // An empty `ps` or registry, or a sample right after the Mac slept, would make every lease look dead.
       const canFree = canFreeLeases({ procCount: procs.length, agentCount: agents.length, now, quietUntil })
-      const doomed = canFree ? leases.filter(l => freeReason(l, ctx) !== undefined) : []
+      const doomed = canFree ? leases.filter(l => !isAvdKey(l.udid) && freeReason(l, ctx) !== undefined) : []
       for (const lease of doomed) {
         await xcsim(['free', lease.udid, '--force', lease.session, lease.agent, String(lease.lastUsed)])
       }
-      const heldNow = leases.filter(l => !doomed.includes(l))
-
-      const reserved = await readReserved($, dir)
 
       if (now - lastRestore >= RESTORE_EVERY_MS) {
         lastRestore = now
         await xcsim(['restore'])
       }
+    }
 
-      // Someone waits for room: a queued test, or an xcsim run/wait of ours holding a command back.
+    // Emulator leases, with or without Xcode (R13, R31): the same reasons as a simulator's, plus
+    // "AVD deleted". The AVD folder is listed only while an emulator lease exists.
+    const keepEmulatorLeases = async (now: number, emulators: EmulatorSeen[], queue: Ticket[], agents: AgentRecord[], procs: Proc[]) => {
+      const devices = emulators.map(emulatorDevice)
+      const running = new Set(devices.map(d => d.udid))
+      // A stopped emulator forgets its agent use: started again, only a new use makes it a room victim (R18).
+      for (const key of usedAt.keys()) if (isAvdKey(key) && !running.has(key)) usedAt.delete(key)
+      const leases = await readLeases($, dir)
+      const found = [...Object.entries(last?.agentUsedAt ?? {}), ...agentUsedAt(agents, devices, leases)]
+      for (const [key, at] of found) if (running.has(key)) usedAt.set(key, Math.max(usedAt.get(key) ?? 0, at))
+
+      const held = leases.filter(l => isAvdKey(l.udid))
+      if (held.length === 0) return
+      if (!canFreeLeases({ procCount: procs.length, agentCount: agents.length, now, quietUntil })) return
+      const busyUdids = busySimulators(agents, queue, devices, leases, now)
+      const ctx = {
+        now,
+        // `running` is this round's process list.
+        listAt: now,
+        liveSessions: liveSessions(agents, new Set(procs.map(p => p.pid))),
+        endedHolders: endedAndIdle(endedHolders(agents), leases, busyUdids),
+        busyUdids,
+        deviceUdids: running,
+        avdKeys: await listAvds(running),
+      }
+      for (const lease of held) {
+        if (freeReason(lease, ctx) === undefined) continue
+        await xcsim(['free', lease.udid, '--force', lease.session, lease.agent, String(lease.lastUsed)])
+      }
+    }
+
+    // The AVDs that exist: the AVD folder's listing, plus every running one (its folder may be elsewhere).
+    // Undefined when the folder cannot be read, so no lease is freed as "AVD deleted".
+    const listAvds = async (running: Set<string>) => {
+      try {
+        const keys = avdKeysIn((await $.fs.list(avdDir)).map(entry => entry.name))
+
+        return new Set([...keys, ...running])
+      } catch {
+        return undefined
+      }
+    }
+
+    // Someone waits for room: a queued test, or an xcsim run/wait of ours holding a command back.
+    // Then one device, simulator or emulator, is shut down: longest unused first, today's rule (R18).
+    const makeRoom = async (now: number, iosDevices: Device[], emulators: EmulatorSeen[], queue: Ticket[], procs: Proc[]) => {
+      // An emulator told to quit is still on while it saves: wait for it rather than pick a second victim.
+      const isQuitting = emuKill !== undefined && now - emuKill.at < EMU_KILL_WAIT_MS &&
+        emulators.some(e => avdKey(e.avd) === emuKill?.key)
+      if (isQuitting) return
+      emuKill = undefined
+      const devices = [...iosDevices, ...emulators.map(emulatorDevice)]
       const xcsimPath = `${$.plugin.root}/bin/xcsim`
       const isWaiting = procs.some(p => p.command.includes(`${xcsimPath} run `) || p.command.includes(`${xcsimPath} wait `))
       const isRoomWanted = queue.some(t => t.waiting === 'room') || isWaiting
-      if (isRoomWanted && devices.filter(d => d.state === 'Booted' || d.state === 'Booting').length >= settings.maxSims) {
-        const victim = shutdownCandidate({
-          devices,
-          leases: heldNow,
-          reserved,
-          reservedNames: namesOf(settings.reservedSims),
-          agentUsedAt: usedAt,
-          inUse: last ? inUseSims(last) : new Set(),
-          now,
-        })
-        if (victim) await run(['xcrun', 'simctl', 'shutdown', victim.udid])
-      }
+      if (!isRoomWanted || devices.filter(d => d.state === 'Booted' || d.state === 'Booting').length < settings.maxSims) return
+      const victim = shutdownCandidate({
+        devices,
+        leases: await readLeases($, dir),
+        reserved: await readReserved($, dir),
+        reservedNames: namesOf(settings.reservedSims),
+        agentUsedAt: usedAt,
+        inUse: last ? inUseSims(last) : new Set(),
+        now,
+      })
+      const argv = victim ? shutdownArgv(victim, adb) : undefined
+      if (!victim || !argv) return
+      if (isAvdKey(victim.udid)) emuKill = { key: victim.udid, at: now }
+      await run(argv)
     }
 
     // The simulator list and heat run on their own, so a tick never waits for
@@ -810,11 +954,6 @@ export const register: Register = (on, options) => {
       const simAnswer = simsRead.take()
       const therm = thermRead.take()
       syncTop()
-      // A stale list waits for a read that starts after the event, not one already going.
-      if ((isSimsStale || now - lastSims >= simsEveryMs) && simsRead.start(now)) {
-        isSimsStale = false
-        lastSims = now
-      }
       if (!h && now - lastTherm >= THERM_EVERY_MS && thermRead.start(now)) lastTherm = now
       // Other accounts' numbers come only from `top`: without them, `ps` stays.
       const fromHelper = h && topCpu.size > 0 ? helperProcs(h.prev, h.cur, { mem: topMem, cpu: topCpu }) : undefined
@@ -826,8 +965,21 @@ export const register: Register = (on, options) => {
       lastSampleAt = now
 
       const procs = fromHelper ? fromHelper.procs : parsePs(psOut)
+      // What this round runs (R2, R28). With no SDK an emulator stays an ordinary process, as today (R3).
+      const isXcode = hasXcode
+      const adbPath = adb
+      const emulatorsOn = adbPath !== undefined ? emulatorProcs(procs) : []
+      const plan = roundPlan({ hasSdk: adbPath !== undefined, hasXcode: isXcode, emulatorCount: emulatorsOn.length, adb: adbPath })
+      // A stale list waits for a read that starts after the event, not one already going.
+      if (plan.isSimctl && (isSimsStale || now - lastSims >= simsEveryMs) && simsRead.start(now)) {
+        isSimsStale = false
+        lastSims = now
+      }
+      const adbOut = plan.adbDevices ? await run(plan.adbDevices) : ''
       await keepReserved(now, procs).catch(() => undefined)
-      if (simAnswer) {
+      // The room step's simulators: the list that just came back, or none on a Mac without Xcode (R31).
+      let roomIos: Device[] | undefined = plan.isSimctl ? undefined : []
+      if (simAnswer && plan.isSimctl) {
         const simOut = simAnswer.text
         const isGood = isSimctlAnswer(simOut)
         simctlFailCount = simctlFails(simctlFailCount, isGood)
@@ -837,10 +989,29 @@ export const register: Register = (on, options) => {
         if (isGood) allSims = parseSimctl(simOut, true)
         if (isGood && sims) watchBoot(sims)
         if (isGood) await keepLeases(now, simAnswer.at, simOut, queue, agents, procs).catch(() => undefined)
+        if (isGood) roomIos = parseDevices(simOut)
       }
-      const bootedUdids = sims ? [...sims].filter(([, info]) => info.state === 'Booted').map(([udid]) => udid) : []
+      // No Xcode: a known-empty simulator list, so nothing below runs simctl. Emulators never enter it.
+      const iosSims = plan.isSimctl ? sims : new Map<string, SimInfo>()
+      const bootedUdids = iosSims ? [...iosSims].filter(([, info]) => info.state === 'Booted').map(([udid]) => udid) : []
       syncAppStreams(bootedUdids.filter(udid => readySims.has(udid)))
-      if (sims) refreshApps(now, bootedUdids)
+      if (plan.isSimctl && sims) refreshApps(now, bootedUdids)
+      // Serials and boot state from adb. No emulator on: forget them all, so a reused port starts over.
+      if (!plan.adbDevices) {
+        adbSeen = []
+        avdOfSerial.clear()
+        readySerials.clear()
+      } else {
+        const listed = parseAdbDevices(adbOut)
+        if (listed && adbPath !== undefined) {
+          adbSeen = listed
+          await askAdb(adbPath, listed, emulatorsOn).catch(() => undefined)
+        }
+      }
+      const emulators = pairEmulators(emulatorsOn, adbSeen, avdOfSerial, readySerials)
+      await keepEmulatorLeases(now, emulators, queue, agents, procs).catch(() => undefined)
+      // With Xcode, room is made when the simulator list is read, as today (R4); without, while an emulator is on.
+      if (roomIos && (plan.isSimctl || emulators.length > 0)) await makeRoom(now, roomIos, emulators, queue, procs).catch(() => undefined)
       if (isSlowDue) {
         lastSlow = now
         const claudePids = procs.filter(p => /claude/.test(p.command)).map(p => String(p.pid))
@@ -851,12 +1022,14 @@ export const register: Register = (on, options) => {
       }
       const grouped = procs.map(p => ({ command: p.command, group: groupOf(p.command) }))
       const buildCommands = grouped.filter(g => g.group === 'builds').map(g => g.command)
-      await resolveWorkspaces(buildCommands)
-      await readSavedDestinations([...new Set(
-        buildCommands.map(c => workspaceOf.get(derivedDataPath(c) ?? '')),
-      )].filter((w): w is string => w !== undefined && w.startsWith('/')))
+      if (plan.isPlutil) {
+        await resolveWorkspaces(buildCommands)
+        await readSavedDestinations([...new Set(
+          buildCommands.map(c => workspaceOf.get(derivedDataPath(c) ?? '')),
+        )].filter((w): w is string => w !== undefined && w.startsWith('/')))
+      }
       const testPids = await readTestApps(procs)
-      await resolveVersions(grouped.filter(g => g.group === 'builds' || g.group === 'xcode').map(g => g.command))
+      if (plan.isPlutil) await resolveVersions(grouped.filter(g => g.group === 'builds' || g.group === 'xcode').map(g => g.command))
 
       const snap = buildSnapshot({
         now,
@@ -864,7 +1037,9 @@ export const register: Register = (on, options) => {
         topMem: fromHelper ? fromHelper.memMb : topMem,
         sysctl,
         cpuPct: h ? hostCpuPct(h.prev, h.cur) : undefined,
-        sims,
+        sims: iosSims,
+        emulators,
+        hasXcode: isXcode,
         claudeCwd,
         prev: last,
         cores,
@@ -879,15 +1054,15 @@ export const register: Register = (on, options) => {
         thermal: h ? thermalOf(h.cur.thermal) : therm && therm.text !== '' ? parseTherm(therm.text) : undefined,
         results: await readResults(now),
         isQueuePaused: await isPaused(),
-        simctl,
+        simctl: plan.isSimctl ? simctl : undefined,
         host: { ...mergeHost(last?.host, hostFound), isSpmBusy: isSpmBusyIn(procs) },
         runningApps: appsFound,
         appStates: appStatesFound,
         readySims,
-        allSims,
+        allSims: plan.isSimctl ? allSims : undefined,
       })
       snap.agentUsedAt = Object.fromEntries(usedAt)
-      refreshHost(now, snap.host)
+      refreshHost(now, snap.host, plan.hostJobs)
       await addBranches(snap, now)
       // An early update refreshes the rest of the panel; the timeline moves on the beat only.
       snap.timeline = isBeat
@@ -970,7 +1145,7 @@ export const register: Register = (on, options) => {
     // Just switched on: hold the simulators this session's agents were already using, before another
     // agent claims them. One already held stays with its holder.
     const holdInUse = async () => {
-      if (!mine) return
+      if (!mine || !hasXcode) return
       const devices = parseDevices(await run(['xcrun', 'simctl', 'list', '-j']))
       for (const { agent, udid } of simsInUse(mine.activities, devices, await $.clock.now())) {
         const id = agent === 'main' ? '' : agent
@@ -1004,6 +1179,7 @@ export const register: Register = (on, options) => {
 
           return
         }
+        if (toolsCheckedAt === 0) await checkTools(await $.clock.now())
         if (!wasOn) await holdInUse().catch(() => undefined)
         const now = await $.clock.now()
         const queue = await readQueue()
@@ -1020,6 +1196,8 @@ export const register: Register = (on, options) => {
           dropSideReads()
           const raw = await readJson<Snapshot>('latest.json')
           snap = raw ? normalizeSnapshot(raw) : null
+          // Follow the leader's Xcode check, so this session's own calls skip xcrun the same way.
+          if (snap) hasXcode = snap.hasXcode !== false
         }
         wantedWatch = { isLeader: wasLeader, pids: agents.map(a => a.pid) }
         syncWatcher()
@@ -1471,7 +1649,7 @@ export const register: Register = (on, options) => {
     const draft = activityOf(e.tool, input)
     const isBash = e.tool === 'Bash' && typeof input.command === 'string'
     const label = baseName(await $.session.cwd())
-    const ctx = {
+    const ctx: ShimContext = {
       root: $.plugin.root,
       sessionId: me,
       agentId: e.agentId ?? '',
@@ -1499,13 +1677,28 @@ export const register: Register = (on, options) => {
     const command = isBash ? (input.command as string) : ''
     // The sampler's list, when it is under 10 s old; else ask simctl.
     const listDevices = async () => {
+      if (!hasXcode) return []
       const now = await $.clock.now()
       if (simList && now - simList.at < SIMS_EVERY_MS) return parseDevices(simList.text)
 
       return parseDevices((await sh(['xcrun', 'simctl', 'list', '-j']))?.stdout ?? '')
     }
+    // Running emulators, from the leader's last sample; they count toward the shared limit (R17).
+    const emulators = isActive ? emulatorsOf((await read($, snapshotAtom))?.sims ?? []) : []
+    const devicesWord = emulators.length > 0 ? 'devices' : 'simulators'
+    const claimEnv = {
+      XCQ_SESSION: me,
+      XCQ_AGENT: e.agentId ?? '',
+      XCQ_LABEL: holderLabel,
+      SIMAPHORE_DIR: dir,
+      XCQ_RESERVED_NAMES: settings.reservedSims,
+      XCQ_RENAME_SIMS: settings.renameSims ? '1' : '0',
+      XCQ_MAX_SIMS: String(settings.maxSims),
+    }
     const routeLease = async (): Promise<Route | undefined> => {
       const isSimCommand = isBash && /\b(?:xcodebuild|simctl)\b/.test(command)
+      // No Xcode: there are no simulators to guard (R30).
+      if (!hasXcode) return undefined
       if (!spec && !isSimCommand) return undefined
       if (spec?.all) return { deny: ALL_SIMS_DENY }
       const devices = await listDevices()
@@ -1524,11 +1717,11 @@ export const register: Register = (on, options) => {
       const reserved = await readReserved($, dir)
       const reservedNames = namesOf(settings.reservedSims)
       const isOwners = device !== undefined && isReserved(device, reserved, reservedNames, originalNameOf(device.name))
-      const reservedReply = { deny: reservedDeny(suggestFree(devices, leases, reserved, reservedNames, device?.name, settings.maxSims)) }
+      const reservedReply = { deny: reservedDeny(suggestFree([...devices, ...emulators], leases, reserved, reservedNames, device?.name, settings.maxSims)) }
       if (isOwners) return reservedReply
 
       const swapped = isBash ? useSimulator(named, spec, udid) : undefined
-      const mustWait = mustWaitForRoom(udid, devices, settings.maxSims)
+      const mustWait = mustWaitForRoom(udid, [...devices, ...emulators], settings.maxSims)
       const wrap = (note: string) => ({
         // The command stays as written (not quoted inside another), so permission checks can read it.
         command: waitForSim(ctx, `${$.plugin.root}/bin/xcsim`, udid, swapped ?? ''),
@@ -1537,21 +1730,10 @@ export const register: Register = (on, options) => {
       })
       // Tests go through the shim, where xcq claims, waits and touches.
       if (isBash && isTestCommand(swapped ?? '')) return { command: swapped }
-      if (mustWait && !isBash) return { deny: `${settings.maxSims} simulators are on, try again shortly` }
-      if (mustWait) return wrap(roomNote(settings.maxSims))
+      if (mustWait && !isBash) return { deny: `${settings.maxSims} ${devicesWord} are on, try again shortly` }
+      if (mustWait) return wrap(roomNote(settings.maxSims, devicesWord))
 
-      const claim = await sh(
-        [`${$.plugin.root}/bin/xcsim`, 'claim', udid],
-        {
-          XCQ_SESSION: me,
-          XCQ_AGENT: e.agentId ?? '',
-          XCQ_LABEL: holderLabel,
-          SIMAPHORE_DIR: dir,
-          XCQ_RESERVED_NAMES: settings.reservedSims,
-          XCQ_RENAME_SIMS: settings.renameSims ? '1' : '0',
-          XCQ_MAX_SIMS: String(settings.maxSims),
-        },
-      )
+      const claim = await sh([`${$.plugin.root}/bin/xcsim`, 'claim', udid], claimEnv)
       switch (claimOutcome(claim?.exitCode)) {
         case 'held': {
           const by = claim?.stdout.trim() || 'another agent'
@@ -1566,11 +1748,113 @@ export const register: Register = (on, options) => {
       // Only a claim made by this call is given back if the call is refused.
       const isNew = claim?.stdout.trim() === 'claimed'
 
-      return { command: swapped, touch: udid, device: isBash ? undefined : udid, ...(isNew && { claimed: udid }) }
+      return { command: swapped, touch: [udid], device: isBash ? undefined : udid, ...(isNew && { claimed: [udid] }) }
+    }
+    const giveBack = async (keys: string[] = []) => {
+      for (const key of keys) {
+        await sh([`${$.plugin.root}/bin/xcsim`, 'free', key], { SIMAPHORE_DIR: dir, XCQ_SESSION: me, XCQ_AGENT: e.agentId ?? '', XCQ_RENAME_SIMS: settings.renameSims ? '1' : '0' })
+      }
+    }
+    // ---- emulators: adb, emulator and android calls in Bash (R7-R12, R15, R17) ----
+    const routeAndroid = async (text: string): Promise<Route | undefined> => {
+      if (!isActive || !isBash || adb === undefined) return undefined
+      const envSerial = await $.env.get('ANDROID_SERIAL')
+      const calls = androidCallsOf(text, {
+        emulators: emulators.flatMap(d => (d.serial ? [d.serial] : [])),
+        ...(envSerial && { serial: envSerial }),
+      })
+      if (calls.length === 0) return undefined
+      // The iOS devices matter only for the room a boot needs.
+      const isNewBoot = calls.some(c => 'avd' in c && c.kind === 'boot' && !emulators.some(d => d.udid === `@${c.avd}`))
+      const devices = [...emulators, ...(isNewBoot ? await listDevices() : [])]
+      const leases = await readLeases($, dir)
+      const reserved = await readReserved($, dir)
+      const reservedNames = namesOf(settings.reservedSims)
+      const routeCtx = { devices, leases, holder, reserved, reservedNames, maxSims: settings.maxSims }
+      const waits = new Map<string, string>()
+      const claims = new Set<string>()
+      const keys: string[] = []
+      for (const call of calls) {
+        const step = androidRoute(call, routeCtx)
+        if ('deny' in step) return step
+        if ('wait' in step) waits.set(step.wait, step.note)
+        else if ('claim' in step) claims.add(step.claim)
+        const key = 'wait' in step ? step.wait : 'claim' in step ? step.claim : undefined
+        if (key !== undefined && !keys.includes(key)) keys.push(key)
+      }
+      for (const key of waits.keys()) claims.delete(key)
+      const xcsim = `${$.plugin.root}/bin/xcsim`
+      // Each key is waited for in turn; `xcsim wait` claims too.
+      const wrapFor = (keys: string[], note: string): Granted => ({
+        command: keys.reduceRight((inner, key) => waitForSim(ctx, xcsim, key, inner), text),
+        wrapped: true,
+        note,
+        keys,
+      })
+      if (waits.size > 0) return wrapFor([...waits.keys(), ...claims], [...waits.values()][0] ?? '')
+
+      const done: string[] = []
+      const isNew: string[] = []
+      for (const key of claims) {
+        const claim = await sh([xcsim, 'claim', key], claimEnv)
+        const outcome = claimOutcome(claim?.exitCode)
+        if (outcome === 'claimed') {
+          done.push(key)
+          if (claim?.stdout.trim() === 'claimed') isNew.push(key)
+          continue
+        }
+        if (outcome === 'skip') continue
+        await giveBack(isNew)
+        if (outcome === 'held') return wrapFor([...claims], heldNote(claim?.stdout.trim() || 'another agent', 'emulator'))
+        if (outcome === 'unavailable') return { deny: CANT_CHECK_DENY }
+        const name = key.slice(1)
+        const free = suggestFree(devices, leases, reserved, reservedNames, name, settings.maxSims, ANDROID_RUNTIME)
+
+        return { deny: reservedDeny(free, 'emulator') }
+      }
+
+      return done.length > 0 || keys.length > 0 ? { touch: done, claimed: isNew, keys } : undefined
+    }
+    // ---- Gradle installs: pick the emulator before any claim, so a refusal leaves nothing behind ----
+    if (isActive && isBash) {
+      const live = emulators.flatMap(d => (d.serial ? [{ key: d.udid, serial: d.serial }] : []))
+      ctx.emulatorsOn = live
+      const calls = gradleCalls(command)
+      if (calls.length > 0) {
+        const held = (await readLeases($, dir)).filter(l => isAvdKey(l.udid) && holderKey(l.session, l.agent) === holder).map(l => l.udid)
+        const envSerial = await $.env.get('ANDROID_SERIAL')
+        const picks = calls.map(c => gradleTarget(c.tasks, held, live, c.serial ?? (envSerial || undefined)))
+        const refused = picks.find(p => 'refuse' in p)
+        if (refused && 'refuse' in refused) return { deny: refused.refuse }
+        const targets = picks.flatMap(p => ('key' in p ? [p] : []))
+        if (targets.some(t => t.key !== targets[0]!.key)) {
+          return { deny: 'simaphore: these Gradle calls install onto different emulators. Run them one at a time.' }
+        }
+        if (targets[0]) ctx.gradleTarget = targets[0]
+      }
     }
     // A command that would take a simulator is refused when the check itself fails.
-    const lease = isActive ? await routeLease().catch((): Route | undefined => (spec ? { deny: CANT_CHECK_DENY } : undefined)) : undefined
-    if (lease && 'deny' in lease) return { deny: lease.deny }
+    const simLease = isActive
+      ? await routeLease().catch((): Route | undefined => (spec && hasXcode ? { deny: CANT_CHECK_DENY } : undefined))
+      : undefined
+    if (simLease && 'deny' in simLease) return { deny: simLease.deny }
+    const android = await routeAndroid(simLease?.command ?? command).catch((): Route | undefined => undefined)
+    if (android && 'deny' in android) {
+      await giveBack(simLease?.claimed)
+
+      return { deny: android.deny }
+    }
+    const lease: Granted | undefined =
+      simLease || android
+        ? {
+            command: android?.command ?? simLease?.command,
+            wrapped: simLease?.wrapped || android?.wrapped,
+            touch: [...(simLease?.touch ?? []), ...(android?.touch ?? [])],
+            claimed: [...(simLease?.claimed ?? []), ...(android?.claimed ?? [])],
+            device: simLease?.device,
+            keys: android?.keys,
+          }
+        : undefined
     const rewrite =
       isActive && isBash && !lease?.wrapped ? rewriteBash(lease?.command ?? command, ctx) : undefined
     const patch = patchOf(lease, rewrite)
@@ -1648,7 +1932,10 @@ export const register: Register = (on, options) => {
         const now = await $.clock.now()
         mine.lastToolAt = now
         const backgrounded = isBackground || rewrite?.isQueued === true || lease?.wrapped === true
-        mine.activities = recordActivity(mine.activities, draft, agent, now, e.tool_use_id, backgrounded)
+        // An adb call that names no emulator is on the one the routing found.
+        const routed = lease?.keys?.[0] ?? ctx.gradleTarget?.key
+        const shown = routed && draft.sim === undefined ? { ...draft, sim: routed } : draft
+        mine.activities = recordActivity(mine.activities, shown, agent, now, e.tool_use_id, backgrounded)
         await writeRecord($, dir, me, mine)
       } catch {
         // the registry is best effort; never block the tool
@@ -1664,11 +1951,11 @@ export const register: Register = (on, options) => {
     }
     // The app may start just before the call returns.
     if (watchesApp && ran.deny === undefined) await claimNewApps().catch(() => undefined)
-    if (lease?.claimed && ran.deny !== undefined) {
-      await sh([`${$.plugin.root}/bin/xcsim`, 'free', lease.claimed], { SIMAPHORE_DIR: dir, XCQ_SESSION: me, XCQ_AGENT: e.agentId ?? '', XCQ_RENAME_SIMS: settings.renameSims ? '1' : '0' })
-    }
-    if (lease?.touch && ran.deny === undefined) {
-      await sh([`${$.plugin.root}/bin/xcsim`, 'touch', lease.touch], { SIMAPHORE_DIR: dir, XCQ_SESSION: me, XCQ_AGENT: e.agentId ?? '' })
+    if (ran.deny !== undefined) await giveBack(lease?.claimed)
+    if (ran.deny === undefined) {
+      for (const key of lease?.touch ?? []) {
+        await sh([`${$.plugin.root}/bin/xcsim`, 'touch', key], { SIMAPHORE_DIR: dir, XCQ_SESSION: me, XCQ_AGENT: e.agentId ?? '' })
+      }
     }
 
     if (draft && mine && !draft.ends) {
@@ -1680,13 +1967,13 @@ export const register: Register = (on, options) => {
         // see above
       }
     }
-    const notes = [rewrite?.isQueued ? QUEUE_NOTE : undefined, lease?.note, ...appNotes].filter((n): n is string => !!n)
+    const notes = [rewrite?.isQueued ? QUEUE_NOTE : undefined, simLease?.note, android?.note, ...appNotes].filter((n): n is string => !!n)
     if (notes.length === 0 || ran.deny !== undefined) return ran
 
     return { ...ran, context: [...(ran.context ?? []), ...notes] }
   }).catch(($, e, next) => {
     // A failed or slow hook: a command that would take a simulator is refused, anything else runs as it was.
-    const takesSim = isCallGated && !next.called && leaseTarget(e.tool, e as unknown as Record<string, unknown>) !== null
+    const takesSim = hasXcode && isCallGated && !next.called && leaseTarget(e.tool, e as unknown as Record<string, unknown>) !== null
 
     return takesSim ? { deny: CANT_CHECK_DENY } : next(e)
   })
@@ -1706,11 +1993,19 @@ export const register: Register = (on, options) => {
     const input: ModelInput | undefined = demo ?? (snap ? { snap, queue, agents, now, settings, leases, reserved } : undefined)
     if (!input) return <Text dimColor>Waiting for the first sample...</Text>
 
+    // A simulator through simctl, an emulator through `adb -s <serial> emu kill` (R19, D16).
     const shutdown = async (udids: string[]) => {
       for (const udid of udids) {
-        const out = await $.process.run(['xcrun', 'simctl', 'shutdown', udid]).catch(() => undefined)
+        const label = isAvdKey(udid) ? udid.slice(1) : udid.slice(0, 8)
+        const serial = input.snap.sims.find(s => s.udid === udid)?.android?.serial
+        const argv = shutdownArgv({ udid, ...(serial !== undefined && { serial }) }, adb)
+        if (!argv) {
+          $.ui.toast(`Could not shut down ${label}: adb does not list it yet`)
+          continue
+        }
+        const out = await $.process.run(argv).catch(() => undefined)
         if (out === undefined || out.exitCode !== 0) {
-          $.ui.toast(`Could not shut down ${udid.slice(0, 8)}: ${out?.stderr.trim() ?? 'failed to run'}`)
+          $.ui.toast(`Could not shut down ${label}: ${out?.stderr.trim() ?? 'failed to run'}`)
         }
       }
     }

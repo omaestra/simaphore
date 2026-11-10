@@ -1,7 +1,7 @@
 // Everything the /simaphore panel shows, worked out from the snapshot, queue and agents.
 // Pure functions: no UI, no I/O, no clock (pass `now`). screen.tsx draws what comes out of here.
 import type { AgentRecord, AppLife, RunResult, Snapshot, ThermalState, Ticket, TimelineSlot } from '../types'
-import { IDLE_CPU, IN_USE_CPU, OWNER_COLOR, UUID_SOURCE, agentColor, assignLetters, flagValue, idleMinutesOf, isAtHomeScreen, orderQueue } from './logic'
+import { ANDROID_RUNTIME, IDLE_CPU, IN_USE_CPU, OWNER_COLOR, UUID_SOURCE, agentColor, assignLetters, flagValue, idleMinutesOf, isAtHomeScreen, orderQueue } from './logic'
 import type { Pose } from './mascot'
 import type { PhoneScreen } from './phone'
 import { SLOT_MS } from './timeline'
@@ -11,7 +11,7 @@ import { TEST_KINDS, type WorkRow, findSim, shortFolder, ticketKind, workRows } 
 // ---------- settings ----------
 
 export type Settings = {
-  /** Simulator budget: at most this many on; further commands wait for room. */
+  /** Simulator and emulator limit: at most this many on, counted together; further commands wait for room. */
   maxSims: number
   /** Rename a held simulator to "🔒 <who> · <name>". */
   renameSims: boolean
@@ -70,9 +70,19 @@ const MEMORY_SCORE: Record<number, number> = { 1: 30, 2: 65, 4: 95 }
 const MEMORY_WORD: Record<number, MemoryWord> = { 1: 'GREEN', 2: 'YELLOW', 4: 'RED' }
 const cap100 = (n: number) => Math.max(0, Math.min(100, n))
 
-/** Booted or booting simulators: they all hold memory. */
+/** Booted or booting simulators and emulators: they all hold memory, and share one limit (R17). */
 export const bootedCount = (snap: Pick<Snapshot, 'sims'>) =>
   snap.sims.filter(s => s.state === 'Booted' || s.state === 'Booting').length
+
+/** An emulator is booting or on: the panel then says "devices" where it said "simulators" (R6). */
+export const hasEmulatorOn = (snap: Pick<Snapshot, 'sims'>) =>
+  snap.sims.some(s => s.runtime === ANDROID_RUNTIME && (s.state === 'Booted' || s.state === 'Booting'))
+
+/** Xcode was found (D11). Older snapshots have no field: they came from a Mac with Xcode. */
+export const hasXcodeIn = (snap: Pick<Snapshot, 'hasXcode'>) => snap.hasXcode !== false
+
+/** The simulator service stopped answering. Never said without Xcode, which has no such service (R29). */
+export const isSimctlHung = (snap: Pick<Snapshot, 'simctlOk' | 'hasXcode'>) => hasXcodeIn(snap) && snap.simctlOk === false
 
 /** The 1-minute load as a share of all cores, 0-100. */
 const loadPercent = (snap: Pick<Snapshot, 'load' | 'cores'>) =>
@@ -110,6 +120,8 @@ export type Header = {
   booted: number
   maxSims: number
   isOverBudget: boolean
+  /** The count includes an emulator: say "devices" (R6, R17). */
+  hasEmulator: boolean
 }
 
 export function headerOf(snap: Snapshot, settings: Settings): Header {
@@ -125,6 +137,7 @@ export function headerOf(snap: Snapshot, settings: Settings): Header {
     booted,
     maxSims: settings.maxSims,
     isOverBudget: booted > settings.maxSims,
+    hasEmulator: hasEmulatorOn(snap),
   }
 }
 
@@ -286,7 +299,7 @@ export function simRows(input: ModelInput, agents: AgentRow[], flagged: Set<stri
   }
   const letters = lettersOf(snap, now)
   const letterOf = (udid: string) => letters[udid] ?? '?'
-  const isHung = snap.simctlOk === false
+  const isHung = isSimctlHung(snap)
   const running = snap.sims.map((sim): SimRow => {
     const idle = idleMinutesOf(snap.idleSince[sim.udid], now)
     const glyph = GLYPH[sim.state] ?? 'shutdown'
@@ -649,9 +662,9 @@ export function alertsOf(input: ModelInput): Alert[] {
     ...clashAlerts(input),
     ...derivedDataAlerts(input),
     ...sharedWindowAlerts(input),
-    ...single(booted > settings.maxSims, 'warning', `${booted} simulators booted, the budget is ${settings.maxSims}`),
+    ...single(booted > settings.maxSims, 'warning', `${booted} ${hasEmulatorOn(snap) ? 'devices' : 'simulators'} booted, the budget is ${settings.maxSims}`),
     ...single(free !== undefined && free < settings.lowDiskGb, 'warning', `Low disk: ${Math.round(free ?? 0)} GB free`),
-    ...single(snap.simctlOk === false, 'critical', 'CoreSimulator is not answering (simctl list failed twice)'),
+    ...single(isSimctlHung(snap), 'critical', 'CoreSimulator is not answering (simctl list failed twice)'),
     ...single(thermalSeverity !== undefined, thermalSeverity ?? 'warning', `Thermal state is ${thermal}`),
     ...single(
       snap.overload.isOverloaded,
@@ -753,6 +766,8 @@ export type Model = {
   queue: QueueRow[]
   isQueuePaused: boolean
   alerts: Alert[]
+  /** Xcode was found; without it the panel hides its Xcode parts (R29). */
+  hasXcode: boolean
 }
 
 /** The snapshot's `xcsim` waiters, named by their session's label. */
@@ -782,5 +797,6 @@ export function buildModel(input: ModelInput): Model {
     queue: queueRows(input),
     isQueuePaused: input.snap.isQueuePaused === true,
     alerts,
+    hasXcode: hasXcodeIn(input.snap),
   }
 }

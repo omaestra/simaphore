@@ -24,6 +24,8 @@ export type SimStat = {
   appCpu?: number
   /** Which build the running app came from, when known; absent in older files. */
   appFrom?: string
+  /** Set on an Android emulator (keyed `@<AVD name>`): its adb serial once adb lists it. */
+  android?: { serial?: string }
 }
 
 /** A simulator that had a letter and is shut down now; the letter is freed after 10 minutes. */
@@ -181,7 +183,10 @@ export type Snapshot = {
   /** True when memory came from top (counts compressed/swapped pages). */
   hasTop: boolean
   groups: GroupStat[]
+  /** Simulators, then Android emulators (keyed `@<AVD name>`). */
   sims: SimStat[]
+  /** False when no Xcode was found (D11); absent when it was, and in older files. */
+  hasXcode?: boolean
   builds: BuildStat[]
   trees: BuildTree[]
   /** Xcode runs whose app still runs in a simulator; rows, not builds (nothing compiles). */

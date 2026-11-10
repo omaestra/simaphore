@@ -11,7 +11,10 @@ finish() { echo; [ $fails -eq 0 ] && echo "ALL PASSED" || echo "$fails FAILED"; 
 
 # make_fake_simctl <dir>: a stand-in `simctl` that prints <dir>/list.json, logs renames to <dir>/log,
 # and fails `list` while <dir>/list.json.fail exists. Never touches a real simulator.
+# Also points DEVELOPER_DIR at a stand-in Xcode folder, so "Xcode is found" never depends on this Mac.
 make_fake_simctl() {
+  mkdir -p "$1/Developer/usr/bin"; : > "$1/Developer/usr/bin/simctl"
+  export DEVELOPER_DIR=$1/Developer
   cat > "$1/simctl" <<'EOT'
 #!/bin/bash
 case $1 in

@@ -2,17 +2,18 @@
 
 The deep details. For the short version, see the [README](../README.md).
 
-A live panel for iOS work with Claude Code. Open it with `/simaphore`. It shows how
-hard your Mac is working, who is using which simulator, and what builds are
-waiting. It also holds a shared queue so Xcode builds run one at a time instead
-of piling up and freezing the machine.
+A live panel for iOS and Android work with Claude Code. Open it with `/simaphore`.
+It shows how hard your Mac is working, who is using which simulator or emulator,
+and what builds are waiting. It also holds a shared queue so Xcode and Gradle
+builds take turns instead of piling up and freezing the machine.
 
 ## On and off
 
 simaphore does nothing until you open the panel.
 
 - Opening `/simaphore` in any session switches it on for every session on this
-  Mac: the build queue, the `-jobs` cap, simulator leases and the Xcode slot.
+  Mac: the build queue, the `-jobs` and `--max-workers` caps, simulator and
+  emulator leases and the Xcode slot.
 - Switching on picks up what is already going on. Builds started while off
   count toward the build limit, so new builds wait for them. A booted
   simulator an agent was using in the last 5 minutes (or is running tests on)
@@ -20,7 +21,7 @@ simaphore does nothing until you open the panel.
 - It stays on while at least one session has the panel open. Closing the last
   panel (or ending that session) switches it off everywhere.
 - Switching off lets go of everything: waiting builds start at once, simulator
-  holds are dropped and held simulators get their names back. Builds already
+  and emulator holds are dropped and held simulators get their names back. Builds already
   running keep running.
 - While off, commands run exactly as typed. simaphore only keeps its list of
   which agent is doing what, so the panel has it when you open it.
@@ -39,7 +40,8 @@ Every section has a short grey line saying what it is for.
   testing, driving a simulator, queued, idle), how long, which simulator it
   holds (`-> A`), and its folder and branch. At 100 columns or wider it also
   shows how the last job ended and how long it took.
-- **Simulators.** Booted devices with a letter, name, runtime, state, who holds
+- **Simulators** (titled **Devices** while an Android emulator is on). Booted
+  simulators and emulators with a letter, name, runtime, state, who holds
   it (an agent in its colour, you in blue, someone else in grey, nobody as a
   dash), memory and idle time. The dot is green when the simulator is booted
   and in use, grey when booted but unused, yellow while booting, red when it is
@@ -47,7 +49,7 @@ Every section has a short grey line saying what it is for.
   Under each booted simulator a dim line lists the apps running in it (read
   every 5 seconds, with each app marked front or suspended). A `!` in the margin means an alert is about that
   row. Shut down devices are hidden until you press `a`. Press Enter on a row
-  for its details.
+  for its details. An emulator shows its AVD name and `Android` as its runtime.
 - **Queue.** Builds waiting for a slot, with position, who asked, why they wait
   and for how long. The title says PAUSED when the queue is paused.
 - **Alerts.** Things that need a look, worst first. Hidden when there are none.
@@ -62,20 +64,20 @@ Every section has a short grey line saying what it is for.
   the legend shows both.
 - **Host.** Free disk, DerivedData and simulator data sizes in MB, GB or TB ("-" when
   not measured), the Xcode in use, and whether the simulator service (CoreSim) is
-  ok or hung.
+  ok or hung. Without Xcode it shows free disk only.
 
 ## Alert rules
 
 Critical (red):
 
-- Two or more people on the same simulator.
+- Two or more people on the same simulator or emulator.
 - Two or more people building into the same DerivedData folder.
-- The simulator service is not answering.
+- The simulator service is not answering (only when Xcode is installed).
 - Thermal state critical, or memory pressure at its worst level.
 
 Warning (yellow):
 
-- More simulators booted than the budget (`maxSims`).
+- More simulators and emulators booted than the limit (`maxSims`).
 - Free disk under `lowDiskGb`.
 - Thermal state serious.
 - Two sessions or helpers used the same Xcode window or workspace (the same
@@ -87,11 +89,12 @@ Warning (yellow):
 ## Keys
 
 - `o` open the settings view
-- `s` shut down the selected simulator
+- `s` shut down the selected simulator or emulator (`adb emu kill` for an emulator)
 - `p` pause or resume the queue
 - `t` show or hide the timeline
 - `a` show or hide shut down simulators
-- `c` clean unavailable simulators (`xcrun simctl delete unavailable`)
+- `c` clean unavailable simulators (`xcrun simctl delete unavailable`); hidden
+  without Xcode
 - `q` close the panel
 
 `s`, `c` and "Shut down all idle" ask twice. The first press shows a yellow
@@ -101,7 +104,8 @@ seconds to go ahead.
 ## Small and short windows
 
 - Under 60 columns the panel is a single line, for example
-  `HIGH 82% | sims 4/2 !1 | q2 | a1/# a2~ a3>`. Agent marks: `#` build, `~`
+  `HIGH 82% | sims 4/2 !1 | q2 | a1/# a2~ a3>` (`devices` instead of `sims`
+  while an emulator is on). Agent marks: `#` build, `~`
   test, `>` driving, `z` queued, `.` idle, `x` error.
 - Under 30 rows the timeline and the blank lines between agents are hidden. Under 22 rows the host is hidden too.
 - If the `NO_COLOR` environment variable is set, nothing is coloured; every
@@ -112,14 +116,17 @@ seconds to go ahead.
 - `maxBuilds` (2): builds that may run at once when memory is fine. Under
   pressure it drops to 1.
 - `swapPercent` (85): memory counts as tight when swap used passes this percent.
-- `maxSims` (2): simulators allowed at once. The panel warns above it. A
-  command that needs a third simulator waits for room (see below).
-- `renameSims` (true): rename a held simulator to show who has it.
-- `reservedSims` (empty): comma-separated simulator names that are always yours.
+- `maxSims` (2): simulators and emulators allowed at once, counted together.
+  The panel warns above it. A command that needs a third device waits for room
+  (see below).
+- `renameSims` (true): rename a held simulator to show who has it. iOS only;
+  emulators are never renamed.
+- `reservedSims` (empty): comma-separated simulator names, or emulator AVD names,
+  that are always yours.
 - `lowDiskGb` (20): warn when free disk is under this many GB.
 - `asciiSymbols` (false): draw `>` `+` `x` `*` instead of the special symbols.
-- `buildJobs` (6): value added as `-jobs` to `xcodebuild` when the command has
-  none.
+- `buildJobs` (6): value added as `-jobs` to `xcodebuild`, or as
+  `--max-workers` to Gradle, when the command has none.
 - `idleMinutes` (10): a simulator is idle after this many minutes under 2% CPU.
 
 ## Simulator leases
@@ -142,10 +149,64 @@ Agents share simulators without fighting over them.
 - Agent commands on all simulators at once (`shutdown all`) are refused.
 
 `bin/xcsim claim <ID>` exit codes: 0 claimed (or already yours), 1 held by
-someone else (prints who), 4 reserved. `bin/xcsim resolve`: 2 no simulator
+someone else (prints who), 4 reserved. An emulator's ID is `@` and its AVD name,
+for example `@Pixel_9`. `bin/xcsim resolve`: 2 no simulator
 matches, 3 more than one matches. For every command: 64 not a simulator ID or
 bad usage (the command runs unchanged), 74 the lease folder is not writable,
 76 the simulator list cannot be read (74 and 76 refuse the command).
+
+## Android emulators
+
+Emulators follow the same lease rules as simulators, keyed by their AVD name.
+simaphore turns on its Android side only when it finds `adb` in
+`$ANDROID_HOME/platform-tools`, `$ANDROID_SDK_ROOT/platform-tools` or
+`~/Library/Android/sdk/platform-tools`. Without it, nothing Android runs.
+
+- An agent's `adb -s <serial> …` on an emulator another agent holds waits, then
+  runs. The target is found the way adb finds it: `-s` first, then
+  `ANDROID_SERIAL`, then the only emulator that is on. `adb devices`, `version`,
+  `help`, `start-server`, `connect` and `pair` never wait.
+- `emulator -avd X` or `emulator @X` waits while X is held, and claims X when it
+  is free. Booting one past the limit waits for room.
+- The `android` command's device commands (`emulator start` and `stop`,
+  `install`, `run`, `screen`, `layout`, `input` and the rest) follow the same
+  rules for the emulator they name or default to.
+- `adb kill-server` and `adb reconnect` hit every device, so they are refused
+  while another agent holds an emulator.
+- An agent may hold one simulator and one emulator at once. Claiming a second
+  emulator lets go of its first one.
+- Only `emulator-<port>` devices count. Phones over USB or Wi-Fi are never held,
+  counted or shut down; commands on them run as typed.
+- To make room, simaphore shuts down an emulator only if an agent used it,
+  nobody holds it, it isn't yours, and no agent used it for 10 minutes. It
+  never shuts down an emulator no agent used.
+- Nothing under `~/.android` is renamed, moved or edited.
+
+## Gradle and the android command
+
+- An agent's `./gradlew …` (any path to `gradlew`) or `gradle …` waits for a
+  slot in the same build queue as `xcodebuild`, and shows in the Queue with its
+  label. `android build`, and `android run` when it builds, do the same.
+- Commands that build nothing pass straight through: `--version`, `--help`,
+  `--stop`, `--status`, `tasks` and `help`.
+- A queued Gradle command with no `--max-workers` gets
+  `--max-workers=<buildJobs>`.
+- An `install…` or `connected…` task first claims its emulator and runs with
+  `ANDROID_SERIAL` set to it, so it waits for the emulator and a slot together.
+  The emulator is the agent's own, else the only one that is on. With several
+  on and none held by the agent, the command is refused with a note listing
+  them; rerun it with `ANDROID_SERIAL=<serial>` in front.
+- Gradle builds outside the queue (a terminal, a script) count toward the build
+  limit while they run. An idle Gradle daemon counts as nothing, and builds
+  started inside Android Studio are not seen.
+- Nothing in your project is written: no `gradle.properties`, no
+  `local.properties`, no init script. Options go only on the command line.
+- Gradle commands now start with the PATH prefix and `bin/xcgradle`, so Claude
+  Code may ask permission for them, and a permission rule that names
+  `./gradlew` may no longer match.
+- Gradle run from inside a script (`sh -c "./gradlew …"`, a Makefile) is not
+  queued and gets no emulator picked for it.
+- Android MCP servers are not covered yet.
 
 Limits: simaphore spots simulator commands by matching the command text. A
 command built to hide it, for example with `eval` or variables, is not caught.
@@ -154,11 +215,13 @@ Your own `!` commands are never blocked.
 ## Scripts
 
 When an agent runs a script (`./run.sh`, `bash x.sh`, `python3 x.py`, `make`,
-`fastlane`), simaphore puts its own `xcodebuild`, `xcrun` and `simctl` first on
-PATH for that command. Inside the script:
+`fastlane`), simaphore puts its own `xcodebuild`, `xcrun` and `simctl`, and
+`adb`, `emulator` and `android`, first on PATH for that command. Inside the
+script:
 
-- A simulator held by another agent is refused at once (exit 75, with a message
-  saying who holds it). Scripts never wait for a simulator.
+- A simulator or emulator held by another agent is refused at once (exit 75,
+  with a message saying who holds it), and so is a boot with no room. Scripts
+  never wait for a device. Otherwise the real tool runs.
 - A script's own `xcodebuild` build still waits in the build queue. A long
   script run in the foreground can hit the Bash timeout, so run it in the
   background.
@@ -218,7 +281,7 @@ even if the session crashed or was killed.
 Try the panel without touching anything real:
 
 - `/simaphore demo` lists the scenarios: calm, overBudget, clash,
-  sharedDerivedData, hungCoreSim, thermal, busy, xcodeTest.
+  sharedDerivedData, hungCoreSim, thermal, busy, xcodeTest, android.
 - `/simaphore demo busy` opens the panel drawing that scenario. The top border says
   `demo: busy`. Buttons do nothing but show a note.
 - `/simaphore demo off` goes back to live data.

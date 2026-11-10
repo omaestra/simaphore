@@ -50,7 +50,7 @@ test('the view shows every setting with its value, help and the simulators', () 
   const text = linesOf(drawSettings(fakeUi, input())).join('\n')
 
   for (const f of FIELDS) expect(text).toContain(f.label)
-  expect(text).toContain('Simulator limit')
+  expect(text).toContain('Simulator and emulator limit')
   expect(text).toContain('[-]')
   expect(text).toContain('[+]')
   expect(text).toContain('[on]')
@@ -84,4 +84,17 @@ test('nothing is wider than the pane, narrow or wide', () => {
   for (const columns of [40, 60, 80, 120]) {
     for (const line of linesOf(drawSettings(fakeUi, input({ columns })))) expect(cellWidth(line) <= columns).toBe(true)
   }
+})
+
+test('the Android wording: one shared limit, AVD names, Gradle workers, renaming iOS only, running AVDs listed', () => {
+  const text = linesOf(drawSettings(fakeUi, input({ simNames: ['Bench 1', 'Pixel_9'], reservedSims: 'Pixel_9' }))).join('\n')
+
+  expect(text).toContain(' Simulator and emulator limit [-]')
+  expect(text).toContain('Most simulators and emulators on at once')
+  expect(text).toContain('--max-workers for Gradle')
+  expect(text).toContain('iOS only. Shows the holder')
+  expect(text).toContain('Agents never get these, iOS or Android (AVD names)')
+  expect(text).toContain('[x] Pixel_9')
+  expect(text).toContain('[ ] Bench 1')
+  for (const line of text.split('\n')) expect(line.includes('…')).toBe(false)
 })

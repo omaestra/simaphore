@@ -6,7 +6,7 @@ import type { Elements } from 'claude-code'
 import type { Confirm } from '../types'
 import { confirmText } from './confirm'
 import { idleMinutesOf } from './logic'
-import { buildModel, pressureLabel, rightmost, timelineLanes } from './model'
+import { buildModel, isSimctlHung, pressureLabel, rightmost, timelineLanes } from './model'
 import type { Model, ModelInput, PressureLabel } from './model'
 import { PHONE_HEIGHT, PHONE_WIDTH, phoneRows } from './phone'
 import { CARD_MASCOT_WIDTH, MASCOT_WIDTH, mascotRows } from './mascot'
@@ -356,16 +356,17 @@ function ShutdownIdle({ c }: { c: Ctx }) {
   )
 }
 
-/** `SIMULATORS · 2 of 2 in use · 1 waiting`. */
+/** `SIMULATORS · 2 of 2 in use · 1 waiting`; DEVICES while an emulator is on (R6). */
 function simulatorsTitle(c: Ctx): string {
   const { cards, agents } = c.model
   if (cards.length === 0) return 'SIMULATORS · none booted'
+  const word = c.model.header.hasEmulator ? 'DEVICES' : 'SIMULATORS'
   const on = cards.filter(x => x.sim.glyph !== 'shutdown')
   const inUse = on.filter(x => x.user !== undefined || x.sim.holder !== undefined).length
   const xcsimWaiting = cards.flatMap(x => x.waiters).filter(w => w.isXcsim).length
   const waiting = agents.filter(a => a.work.isWaiting && a.work.sim !== undefined).length + xcsimWaiting
 
-  return `SIMULATORS · ${inUse} of ${on.length} in use${waiting > 0 ? ` · ${waiting} waiting` : ''}`
+  return `${word} · ${inUse} of ${on.length} in use${waiting > 0 ? ` · ${waiting} waiting` : ''}`
 }
 
 function Simulators(c: Ctx) {
@@ -665,14 +666,18 @@ function hostSegs(c: Ctx): Seg[][] {
   const { snap } = c.p.input
   const host = snap.host ?? {}
   const low = host.freeGb !== undefined && host.freeGb < c.model.settings.lowDiskGb
-  const isHung = snap.simctlOk === false
+  const isHung = isSimctlHung(snap)
   const sep = dim(' · ')
+  const disk = [seg(' disk free '), seg(mbOrDash(host.freeGb === undefined ? undefined : host.freeGb * 1024), low ? { color: RED, bold: true } : {})]
+  const spm = host.isSpmBusy === true ? [sep, seg('package fetch running')] : []
+  // No Xcode: no Xcode, CoreSim, DerivedData or simulator-data parts, and nothing in their place (R29).
+  if (!c.model.hasXcode) return [[...disk, ...spm]]
 
   return [
-    [seg(' disk free '), seg(mbOrDash(host.freeGb === undefined ? undefined : host.freeGb * 1024), low ? { color: RED, bold: true } : {}),
+    [...disk,
       sep, seg('DerivedData '), seg(mbOrDash(host.derivedDataMb)),
       sep, seg('simulator data '), seg(mbOrDash(host.simDevicesMb)),
-      ...(host.isSpmBusy === true ? [sep, seg('package fetch running')] : [])],
+      ...spm],
     [seg(` Xcode ${host.xcodeVersion ?? '—'}`), ...(host.xcodePath === undefined ? [] : [dim(` ${host.xcodePath}`)]),
       sep, seg('CoreSim '), seg(isHung ? 'hung' : 'ok', isHung ? { color: RED, bold: true } : { color: GREEN })],
   ]
@@ -683,7 +688,7 @@ function Host(c: Ctx) {
 
   return (
     <Box flexDirection="column">
-      <Section c={c} title="HOST" about="disk space, Xcode and the simulator service" />
+      <Section c={c} title="HOST" about={c.model.hasXcode ? 'disk space, Xcode and the simulator service' : 'disk space'} />
       {hostSegs(c).map((l, i) => <Line key={`o${i}`} c={c} segs={l} />)}
     </Box>
   )
@@ -756,7 +761,7 @@ function headerLines(c: Ctx): Seg[][] {
     [seg('mem ', { dim: true }), seg(h.memory, { color: memColor }),
       dim(` · swap ${sizeText(h.swapUsedMb)} · thermal ${h.thermal}`)],
     [seg('CPU ', { dim: true }), seg(`${h.cpuPct}%`), dim(` · xcodebuild ${times(c)}${h.xcodebuilds} · `),
-      seg(`Sims ${h.booted}/max ${h.maxSims}`, over ? { color: RED, bold: true } : {})],
+      seg(`${h.hasEmulator ? 'Devices' : 'Sims'} ${h.booted}/max ${h.maxSims}`, over ? { color: RED, bold: true } : {})],
   ]
   const blank = [seg(' '.repeat(MASCOT_WIDTH))]
 
@@ -784,7 +789,7 @@ function keysOf(c: Ctx): Key[] {
     { key: 'clean', hotkey: 'c', label: 'clean', run: actions.clean },
     { key: 'settings', hotkey: 'o', label: 'settings', run: actions.openSettings },
     { key: 'close', hotkey: 'q', label: 'close', run: actions.close },
-  ]
+  ].filter(k => k.key !== 'clean' || c.model.hasXcode)   // `c` deletes unavailable simulators: Xcode only (R29)
 }
 
 /** Keys split into lines that fit: each takes `k: label` plus a ` · ` between them. */
@@ -843,7 +848,7 @@ export function statusLine(c: Ctx): Seg[] {
   return [
     seg(`${label} ${header.pressure.score}%`, { color: MOOD[label].color, bold: true }),
     dim(' │ '),
-    seg(`sims ${header.booted}/${header.maxSims}`, header.isOverBudget ? { color: RED, bold: true } : {}),
+    seg(`${header.hasEmulator ? 'devices' : 'sims'} ${header.booted}/${header.maxSims}`, header.isOverBudget ? { color: RED, bold: true } : {}),
     seg(alertText, { color: RED, bold: true }),
     dim(' │ '),
     seg(`q${queue.length}`),

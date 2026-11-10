@@ -1,0 +1,9 @@
+#!/bin/bash
+# PATH shim: `emulator` on an emulator another agent holds is refused (exit 75), like shim/simctl.
+src=$0
+while [ -L "$src" ]; do t=$(readlink "$src"); case $t in /*) src=$t ;; *) src=$(dirname "$src")/$t ;; esac; done
+BIN=$(cd "$(dirname "$src")" && pwd -P)
+. "$BIN/../lib.sh"
+real=$(real_tool emulator) || { echo "emulator: command not found" >&2; exit 127; }
+emu_guard emulator "$@" || exit $?
+exec "$real" "$@"
