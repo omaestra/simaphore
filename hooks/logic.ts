@@ -203,6 +203,17 @@ export function parseDu(text: string): number | undefined {
   return text.trim() !== '' && Number.isFinite(kb) && kb >= 0 ? Math.round(kb / 1024) : undefined
 }
 
+/** The version in a plugin.json, or undefined when it has none. */
+export function manifestVersion(text: string): string | undefined {
+  try {
+    const v = (JSON.parse(text) as { version?: unknown }).version
+
+    return typeof v === 'string' && v !== '' ? v : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** A Swift package fetch or resolve is running. */
 export const isSpmBusyIn = (procs: { command: string }[]) =>
   procs.some(p => /swift-package|-resolvePackageDependencies/.test(p.command))

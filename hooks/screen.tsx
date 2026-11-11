@@ -66,6 +66,8 @@ export type ScreenInput = {
   spareCount: number
   /** Set while the panel draws a demo scenario instead of live data. */
   demo?: string
+  /** The plugin's version, shown after the name in the top border. */
+  version?: string
   actions: ScreenActions
 }
 
@@ -737,7 +739,8 @@ export const staleSeconds = (c: Ctx) => {
 
 function topBorder(c: Ctx): Seg[] {
   const stale = staleSeconds(c)
-  const left = [dim('╭─ '), seg('simaphore', { bold: true })]
+  const versionSegs = c.p.version === undefined ? [] : [dim(` ${c.p.version}`)]
+  const left = [dim('╭─ '), seg('simaphore', { bold: true }), ...versionSegs]
   const demoSegs = c.p.demo === undefined ? [] : [seg(` demo: ${c.p.demo}`, { color: YELLOW, bold: true })]
   const staleSegs = stale === undefined ? [] : [seg(` stale ${stale}s`, { color: RED, bold: true })]
   const right = [seg(` ${c.p.clock} `, { dim: true }), dim('─╮')]
