@@ -51,6 +51,16 @@ test('the header box shows the title, clock, mascot rows and the three status li
   expect(lines[4]?.startsWith('╰')).toBe(true)
 })
 
+test('the top border shows the version after the name, at the same width', () => {
+  const plain = draw('busy', 80)[0] ?? ''
+  const top = draw('busy', 80, { version: '1.1.0' })[0] ?? ''
+
+  expect(top.startsWith('╭─ simaphore 1.1.0 ')).toBe(true)
+  expect(top).toContain(' 14:32 ')
+  expect([...top].length).toBe([...plain].length)
+  expect(plain).not.toContain('1.1.0')
+})
+
 test('the header shows stale data in the top border', () => {
   const s = screenOf('calm', 80)
   const old = { ...s, input: { ...s.input, now: s.input.now + 30_000 } }

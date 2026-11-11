@@ -47,6 +47,7 @@ import {
   appsInSims,
   recordActivity,
   xcodeSlotArgv,
+  manifestVersion,
 } from './logic'
 
 const UDID_A = '11111111-AAAA-4BBB-8CCC-222222222222'
@@ -1039,4 +1040,13 @@ test('activityOf: gradle', () => {
   for (const none of ['./gradlew --stop', './gradlew --version', './gradlew -v', './gradlew', './gradlew tasks', './gradlew help', './gradlew --status', './gradlew -? assembleDebug', 'echo ./gradlew build']) {
     expect(of(none)).toBeNull()
   }
+})
+
+test('the version comes from the plugin manifest, and is missing when it cannot be read', () => {
+  expect(manifestVersion('{ "name": "simaphore", "version": "1.1.0" }')).toBe('1.1.0')
+  expect(manifestVersion('{ "name": "simaphore" }')).toBeUndefined()
+  expect(manifestVersion('{ "version": "" }')).toBeUndefined()
+  expect(manifestVersion('{ "version": 2 }')).toBeUndefined()
+  expect(manifestVersion('')).toBeUndefined()
+  expect(manifestVersion('not json')).toBeUndefined()
 })

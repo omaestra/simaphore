@@ -1,6 +1,6 @@
 {
   "name": "simaphore",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Traffic lights for iOS simulators, Android emulators and their builds (Xcode, Gradle and the android command) when several Claude Code agents share one Mac: a live panel, a build queue and device leases.",
   "types": "./types/index.d.ts",
   "userConfig": {

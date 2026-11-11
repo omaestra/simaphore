@@ -71,6 +71,7 @@ import {
   roundPlan,
   simctlIn,
   statusLine,
+  manifestVersion,
 } from './logic'
 import type { EmulatorSeen, HostJob, Proc, ShimContext, SimInfo } from './logic'
 import {
@@ -347,6 +348,8 @@ export const register: Register = (on, options) => {
   let isMono = false
   // The Claude Code theme: read when the session starts and again whenever it is changed.
   let theme: Theme = 'dark'
+  // This plugin's version from its manifest, read when the session starts.
+  let version: string | undefined
   let wasLeader = false
   let last: Snapshot | null = null
   let topMem = new Map<number, number>()
@@ -433,6 +436,7 @@ export const register: Register = (on, options) => {
     }
     isMono = ((await $.env.get('NO_COLOR')) ?? '') !== ''
     theme = themeOf((await $.config.list()).find(row => row.key === 'theme')?.value)
+    version = manifestVersion(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).catch(() => ''))
     await $.command.register({ name: 'simaphore', description: 'Show the simaphore pane (demo <name> | demo off)' })
 
     const readJson = async <T,>(file: string): Promise<T | undefined> => {
@@ -2098,6 +2102,7 @@ export const register: Register = (on, options) => {
       idleUdids,
       spareCount: spare.length,
       demo: demoName ?? undefined,
+      version,
       actions: {
         close: () => $.ui.close({ id: PANE }),
         pause: doing(pid => xcpause('pause', String(pid))),
